@@ -26,6 +26,7 @@
   - Facebook (Vidéos HD/SD)
 - **🧠 Intelligence Artificielle :** Assistant IA conversationnel intégré (`.ai`, `.gpt`).
 - **🛠️ Outils & Utilitaires :**
+  - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker to Command (.setcmd) :** Associez n'importe quel sticker WhatsApp comme raccourci/alias d'une commande (ex: `.setcmd ping`, `.setcmd save`, `.setcmd menu`).
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
@@ -83,7 +84,8 @@ PORT=3000
 BOT_NAME=KAIDO-MD
 OWNER_NUMBER=50947440869
 PREFIX=.
-ADMIN_PASS=adminplag
+# Obligatoire : accès au dashboard par mot de passe uniquement
+ADMIN_PASS=un-mot-de-passe-long-et-aleatoire
 MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net
 
 # Requis uniquement pour importer un pack avec .tgs
@@ -94,6 +96,10 @@ TELEGRAM_BOT_TOKEN=
 FACEBOOK_DOWNLOADER_API=https://fdown.isuru.eu.org
 COBALT_API_URLS=https://rue-cobalt.xenon.zone,https://cobaltapi.cjs.nz
 COBALT_API_KEY=
+
+# Facultatif : photos Pexels prioritaires pour `.img`.
+# Sans clé, `.img` utilise automatiquement Openverse.
+PEXELS_API_KEY=
 ```
 
 > La page publique `t.me/addstickers/...` ne contient plus les fichiers `.tgs`. La commande `.tgs` utilise donc l’API officielle Telegram (`getStickerSet` puis `getFile`), ce qui nécessite `TELEGRAM_BOT_TOKEN`. Le token reste côté serveur et n’est jamais envoyé dans les messages ou les logs d’erreur.
@@ -106,6 +112,10 @@ npm start
 Le serveur démarrera sur `http://localhost:3000` :
 - **Page de pairing :** `http://localhost:3000/pair`
 - **Dashboard :** `http://localhost:3000/dashboard`
+
+Le dashboard demande uniquement `ADMIN_PASS` — aucun nom d’utilisateur. Les pages et les API de gestion sont protégées par un cookie signé, `HttpOnly` et `SameSite=Strict`. Si `ADMIN_PASS` est absent, l’accès administratif est refusé plutôt que d’utiliser un mot de passe par défaut.
+
+Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`; le bot reconnaît aussi les anciens formats MongoDB et les identités WhatsApp LID lorsque le numéro alternatif est disponible. Une chaîne ajoutée depuis le dashboard est enregistrée avec les mêmes emojis que `.cfn`, puis suivie immédiatement par toutes les sessions actives.
 
 ---
 

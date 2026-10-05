@@ -139,7 +139,8 @@
                 
                 if (response.ok) {
                     messageDiv.className = 'message success';
-                    messageDiv.textContent = '✅ Newsletter ajoutée avec succès!';
+                    const emojiText = data.emojis?.length ? data.emojis.join(' ') : 'emojis par défaut';
+                    messageDiv.textContent = `✅ Chaîne enregistrée avec ${emojiText}. ${data.synchronized || 0} session(s) synchronisée(s).`;
                     document.getElementById('addForm').reset();
                 } else {
                     messageDiv.className = 'message error';

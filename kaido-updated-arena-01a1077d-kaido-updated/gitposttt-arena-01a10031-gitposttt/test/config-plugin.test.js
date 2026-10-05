@@ -73,3 +73,21 @@ test('un utilisateur non propriétaire ne peut pas changer la configuration', as
   assert.equal(fixture.saved.length, 0);
   assert.match(fixture.sent[0].content.text, /propriétaire/i);
 });
+
+test('un admin défini dans Mongo peut modifier la configuration', async () => {
+  const fixture = createContext(['setprefix', '!'], {
+    senderNumber: '50922222222',
+    isMongoAdmin: true
+  });
+  await plugin.execute(fixture.context);
+  assert.equal(fixture.saved[0].config.PREFIX, '!');
+});
+
+test('un propriétaire de session résolu depuis une identité LID peut modifier la configuration', async () => {
+  const fixture = createContext(['setprefix', '#'], {
+    senderNumber: '123456789012345',
+    isSessionOwner: true
+  });
+  await plugin.execute(fixture.context);
+  assert.equal(fixture.saved[0].config.PREFIX, '#');
+});

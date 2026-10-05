@@ -25,6 +25,20 @@ const {
   wakeForCommand,
   applyAlwaysOnlineSetting
 } = require('./services/presence-mode');
+const {
+  canonicalAdmin,
+  collectMessageIdentifiers,
+  addIdentifierCandidates,
+  ownerNumbers,
+  resolveAccess
+} = require('./services/access-control');
+const {
+  DEFAULT_NEWSLETTER_EMOJIS,
+  normaliseNewsletterJid,
+  normaliseEmojiList,
+  resolveNewsletterEmojis,
+  syncNewsletterSockets
+} = require('./services/newsletter-config');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('./files/sticker_cmd');
 const { findReactionCommand, initReactionDb } = require('./files/reaction_cmd');
@@ -119,6 +133,8 @@ function isKnownCommandName(command) {
 
 const SESSION_CONFIG_CACHE_TTL_MS = 5_000;
 const sessionConfigCache = new Map();
+const ADMIN_CACHE_TTL_MS = 5_000;
+let adminCache = { value: [], expiresAt: 0 };
 
 const config = {
   MAX_RETRIES: 3,
@@ -137,6 +153,9 @@ const config = {
   BUTTON_IMAGES: { ALIVE: 'https://files.catbox.moe/l1lzbx.png' }
 };
 
+function primaryOwnerNumber() {
+  return ownerNumbers(config.OWNER_NUMBER)[0] || '';
+}
 
 // ---------------- MONGO SETUP ----------------
 
@@ -226,12 +245,26 @@ async function getAllNumbersFromMongo() {
   } catch (e) { console.error('getAllNumbersFromMongo', e); return []; }
 }
 
-async function loadAdminsFromMongo() {
+async function loadAdminsFromMongo(forceRefresh = false) {
   try {
+    if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
     await initMongo();
     const docs = await adminsCol.find({}).toArray();
-    return docs.map(d => d.jid || d.number).filter(Boolean);
-  } catch (e) { console.error('loadAdminsFromMongo', e); return []; }
+    const admins = [];
+    const seen = new Set();
+    for (const doc of docs) {
+      const identity = canonicalAdmin(doc);
+      const value = identity.jid || identity.raw;
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      admins.push(value);
+    }
+    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS };
+    return [...admins];
+  } catch (e) {
+    console.error('loadAdminsFromMongo', e);
+    return adminCache.value.length ? [...adminCache.value] : [];
+  }
 }
 
 // Récupérer le statut d'un groupe (welcome ou goodbye)
@@ -265,34 +298,79 @@ async function setGroupFeatureStatus(groupId, feature, status) {
 async function addAdminToMongo(jidOrNumber) {
   try {
     await initMongo();
-    const doc = { jid: jidOrNumber };
-    await adminsCol.updateOne({ jid: jidOrNumber }, { $set: doc }, { upsert: true });
-    console.log(`Added admin ${jidOrNumber}`);
-  } catch (e) { console.error('addAdminToMongo', e); }
+    const identity = canonicalAdmin(jidOrNumber);
+    if (!identity.number) throw new Error('Numéro ou JID administrateur invalide');
+    const jid = identity.jid || identity.raw;
+    const filters = [{ jid }, { jid: identity.raw }];
+    if (identity.number) filters.push({ number: identity.number });
+    await adminsCol.updateOne(
+      { $or: filters },
+      { $set: { jid, number: identity.number || null, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    adminCache = { value: [], expiresAt: 0 };
+    console.log(`Added admin ${jid}`);
+    return jid;
+  } catch (e) {
+    console.error('addAdminToMongo', e);
+    throw e;
+  }
 }
 
 async function removeAdminFromMongo(jidOrNumber) {
   try {
     await initMongo();
-    await adminsCol.deleteOne({ jid: jidOrNumber });
-    console.log(`Removed admin ${jidOrNumber}`);
-  } catch (e) { console.error('removeAdminFromMongo', e); }
+    const identity = canonicalAdmin(jidOrNumber);
+    const docs = await adminsCol.find({}).toArray();
+    const matchingIds = docs
+      .filter(doc => {
+        const existing = canonicalAdmin(doc);
+        return (identity.number && existing.number === identity.number) ||
+          (identity.raw && existing.raw === identity.raw) ||
+          (identity.jid && existing.jid === identity.jid);
+      })
+      .map(doc => doc._id)
+      .filter(Boolean);
+    if (matchingIds.length) await adminsCol.deleteMany({ _id: { $in: matchingIds } });
+    adminCache = { value: [], expiresAt: 0 };
+    console.log(`Removed admin ${identity.jid || identity.raw}`);
+    return true;
+  } catch (e) {
+    console.error('removeAdminFromMongo', e);
+    throw e;
+  }
 }
 
 async function addNewsletterToMongo(jid, emojis = []) {
   try {
     await initMongo();
-    const doc = { jid, emojis: Array.isArray(emojis) ? emojis : [], addedAt: new Date() };
-    await newsletterCol.updateOne({ jid }, { $set: doc }, { upsert: true });
-    console.log(`Added newsletter ${jid} -> emojis: ${doc.emojis.join(',')}`);
+    const normalizedJid = normaliseNewsletterJid(jid);
+    if (!normalizedJid) throw new Error('JID de chaîne invalide');
+    const normalizedEmojis = normaliseEmojiList(emojis);
+    const doc = { jid: normalizedJid, emojis: normalizedEmojis, updatedAt: new Date() };
+
+    // Les deux collections historiques restent synchronisées afin que le
+    // dashboard et `.cfn` alimentent exactement le même moteur de réactions.
+    await Promise.all([
+      newsletterCol.updateOne({ jid: normalizedJid }, { $set: doc, $setOnInsert: { addedAt: new Date() } }, { upsert: true }),
+      newsletterReactsCol.updateOne({ jid: normalizedJid }, { $set: doc, $setOnInsert: { addedAt: new Date() } }, { upsert: true })
+    ]);
+    console.log(`Added newsletter ${normalizedJid} -> emojis: ${normalizedEmojis.join(',')}`);
+    return { jid: normalizedJid, emojis: normalizedEmojis };
   } catch (e) { console.error('addNewsletterToMongo', e); throw e; }
 }
 
 async function removeNewsletterFromMongo(jid) {
   try {
     await initMongo();
-    await newsletterCol.deleteOne({ jid });
-    console.log(`Removed newsletter ${jid}`);
+    const normalizedJid = normaliseNewsletterJid(jid);
+    if (!normalizedJid) throw new Error('JID de chaîne invalide');
+    await Promise.all([
+      newsletterCol.deleteOne({ jid: normalizedJid }),
+      newsletterReactsCol.deleteOne({ jid: normalizedJid })
+    ]);
+    console.log(`Removed newsletter ${normalizedJid}`);
+    return normalizedJid;
   } catch (e) { console.error('removeNewsletterFromMongo', e); throw e; }
 }
 
@@ -300,7 +378,12 @@ async function listNewslettersFromMongo() {
   try {
     await initMongo();
     const docs = await newsletterCol.find({}).toArray();
-    return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
+    return docs
+      .map(doc => ({
+        jid: normaliseNewsletterJid(doc.jid),
+        emojis: normaliseEmojiList(doc.emojis)
+      }))
+      .filter(doc => doc.jid);
   } catch (e) { console.error('listNewslettersFromMongo', e); return []; }
 }
 
@@ -518,34 +601,31 @@ async function setStatusInfractionCount(sessionId, groupId, participant, count) 
 // -------------- newsletter react-config helpers --------------
 
 async function addNewsletterReactConfig(jid, emojis = []) {
-  try {
-    await initMongo();
-    await newsletterReactsCol.updateOne({ jid }, { $set: { jid, emojis, addedAt: new Date() } }, { upsert: true });
-    console.log(`Added react-config for ${jid} -> ${emojis.join(',')}`);
-  } catch (e) { console.error('addNewsletterReactConfig', e); throw e; }
+  return addNewsletterToMongo(jid, emojis);
 }
 
 async function removeNewsletterReactConfig(jid) {
-  try {
-    await initMongo();
-    await newsletterReactsCol.deleteOne({ jid });
-    console.log(`Removed react-config for ${jid}`);
-  } catch (e) { console.error('removeNewsletterReactConfig', e); throw e; }
+  return removeNewsletterFromMongo(jid);
 }
 
 async function listNewsletterReactsFromMongo() {
   try {
     await initMongo();
     const docs = await newsletterReactsCol.find({}).toArray();
-    return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
+    return docs
+      .map(doc => ({ jid: normaliseNewsletterJid(doc.jid), emojis: normaliseEmojiList(doc.emojis) }))
+      .filter(doc => doc.jid);
   } catch (e) { console.error('listNewsletterReactsFromMongo', e); return []; }
 }
 
 async function getReactConfigForJid(jid) {
   try {
     await initMongo();
-    const doc = await newsletterReactsCol.findOne({ jid });
-    return doc ? (Array.isArray(doc.emojis) ? doc.emojis : []) : null;
+    const normalizedJid = normaliseNewsletterJid(jid);
+    if (!normalizedJid) return null;
+    const doc = await newsletterCol.findOne({ jid: normalizedJid }) ||
+      await newsletterReactsCol.findOne({ jid: normalizedJid });
+    return doc ? normaliseEmojiList(doc.emojis) : null;
   } catch (e) { console.error('getReactConfigForJid', e); return null; }
 }
 
@@ -667,7 +747,7 @@ async function sendAdminConnectMessage(socket, number, groupResult, sessionConfi
 
 async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfig = {}) {
   try {
-    const ownerJid = `${config.OWNER_NUMBER.replace(/[^0-9]/g,'')}@s.whatsapp.net`;
+    const ownerJid = `${primaryOwnerNumber()}@s.whatsapp.net`;
     const activeCount = activeSockets.size;
     const botName = sessionConfig.botName || BOT_NAME_FANCY;
     const image = sessionConfig.logo || config.RCD_IMAGE_PATH;
@@ -741,23 +821,30 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
     const jid = message.key.remoteJid;
 
     try {
+      const normalizedJid = normaliseNewsletterJid(jid);
+      if (!normalizedJid) return;
       const followedDocs = await listNewslettersFromMongo(); // array of {jid, emojis}
-      const reactConfigs = await listNewsletterReactsFromMongo(); // [{jid, emojis}]
+      const reactConfigs = await listNewsletterReactsFromMongo(); // compatibilité ancienne collection
       const reactMap = new Map();
-      for (const r of reactConfigs) reactMap.set(r.jid, r.emojis || []);
-
-      const followedJids = followedDocs.map(d => d.jid);
-      if (!followedJids.includes(jid) && !reactMap.has(jid)) return;
-
-      let emojis = reactMap.get(jid) || null;
-      if ((!emojis || emojis.length === 0) && followedDocs.find(d => d.jid === jid)) {
-        emojis = (followedDocs.find(d => d.jid === jid).emojis || []);
+      for (const item of reactConfigs) {
+        const itemJid = normaliseNewsletterJid(item.jid);
+        if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
       }
-      if (!emojis || emojis.length === 0) emojis = config.AUTO_LIKE_EMOJI;
 
-      let idx = rrPointers.get(jid) || 0;
+      const followed = followedDocs.find(item => item.jid === normalizedJid);
+      if (!followed && !reactMap.has(normalizedJid)) return;
+
+      // newsletter_list est la source principale partagée par le dashboard et
+      // `.cfn`; l'ancienne collection ne sert que de compatibilité.
+      const emojis = resolveNewsletterEmojis(
+        followed?.emojis,
+        reactMap.get(normalizedJid),
+        DEFAULT_NEWSLETTER_EMOJIS
+      );
+
+      let idx = rrPointers.get(normalizedJid) || 0;
       const emoji = emojis[idx % emojis.length];
-      rrPointers.set(jid, (idx + 1) % emojis.length);
+      rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
 
       const messageId = message.newsletterServerId || message.key.id;
       if (!messageId) return;
@@ -766,12 +853,12 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
       while (retries-- > 0) {
         try {
           if (typeof socket.newsletterReactMessage === 'function') {
-            await socket.newsletterReactMessage(jid, messageId.toString(), emoji);
+            await socket.newsletterReactMessage(normalizedJid, messageId.toString(), emoji);
           } else {
-            await socket.sendMessage(jid, { react: { text: emoji, key: message.key } });
+            await socket.sendMessage(normalizedJid, { react: { text: emoji, key: message.key } });
           }
-          console.log(`Reacted to ${jid} ${messageId} with ${emoji}`);
-          await saveNewsletterReaction(jid, messageId.toString(), emoji, sessionNumber || null);
+          console.log(`Reacted to ${normalizedJid} ${messageId} with ${emoji}`);
+          await saveNewsletterReaction(normalizedJid, messageId.toString(), emoji, sessionNumber || null);
           break;
         } catch (err) {
           console.warn(`Reaction attempt failed (${3 - retries}/3):`, err?.message || err);
@@ -1268,13 +1355,20 @@ function setupCommandHandlers(socket, number) {
         const reactorJid = msg.key.fromMe 
           ? (socket.user?.id ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : msg.key.remoteJid)
           : (msg.key.participant || msg.key.remoteJid);
-        const reactorNumber = (reactorJid || '').split('@')[0];
-        const isReactorOwner = reactorNumber === config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+        const reactorNumber = (reactorJid || '').split('@')[0].split(':')[0];
 
-        // Vérifier le mode privé si configuré
-        const sanitizedBot = String(socket.user?.id || '').replace(/[^0-9]/g, '');
-        const sessionCfg = await loadSessionConfigMerged(number || sanitizedBot);
-        if (sessionCfg && sessionCfg.MODE === 'private' && !isReactorOwner && reactorNumber !== sanitizedBot) {
+        // Vérifier le mode privé et les droits avec la même source que les commandes texte.
+        const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+        const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
+        const reactorIdentifiers = collectMessageIdentifiers(msg, reactorJid, reactorNumber);
+        const reactorAccess = resolveAccess({
+          identifiers: reactorIdentifiers,
+          ownerValue: config.OWNER_NUMBER,
+          adminEntries: await loadAdminsFromMongo(),
+          sessionNumber: sanitizedBot
+        });
+        const isReactorOwner = reactorAccess.isConfiguredOwner;
+        if (sessionCfg && sessionCfg.MODE === 'private' && !reactorAccess.isPrivileged) {
           return;
         }
 
@@ -1324,6 +1418,10 @@ function setupCommandHandlers(socket, number) {
           args: cmdArgs,
           body: fullBody,
           isOwner: isReactorOwner,
+          isSessionOwner: reactorAccess.isSessionOwner,
+          isMongoAdmin: reactorAccess.isMongoAdmin,
+          isPrivileged: reactorAccess.isPrivileged,
+          access: reactorAccess,
           config,
           sessionCfg,
           prefix: cmdPrefix,
@@ -1527,14 +1625,41 @@ function setupCommandHandlers(socket, number) {
     const nowsender = msg.key.fromMe
       ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
       : (msg.key.participant || remoteJid);
-    const senderNumber = (nowsender || '').split('@')[0];
+    const senderNumber = (nowsender || '').split('@')[0].split(':')[0];
     const botNumber = socket.user.id ? socket.user.id.split(':')[0] : '';
     const sanitizedBot = String(number || botNumber || '').replace(/[^0-9]/g, '');
     const sessionCfg = cfg;
-    const isOwner = senderNumber === config.OWNER_NUMBER.replace(/[^0-9]/g, '');
 
-    // En mode privé, une commande non autorisée reste silencieuse et non lue.
-    if (sessionCfg && sessionCfg.MODE === 'private' && !isOwner && senderNumber !== sanitizedBot) {
+    // WhatsApp utilise parfois un LID dans les groupes. participantAlt fournit
+    // généralement le numéro; sinon on complète depuis les métadonnées du groupe.
+    const senderIdentifiers = collectMessageIdentifiers(msg, nowsender, senderNumber);
+    if (from.endsWith('@g.us') && String(nowsender).includes('@lid')) {
+      try {
+        const metadata = await socket.groupMetadata(from);
+        const participant = (metadata?.participants || []).find(item => {
+          const values = [item.id, item.jid, item.lid, item.phoneNumber, item.pn]
+            .filter(Boolean)
+            .map(value => String(value).toLowerCase());
+          return values.some(value => senderIdentifiers.has(value));
+        });
+        if (participant) addIdentifierCandidates(senderIdentifiers, participant);
+      } catch (error) {
+        console.warn('[ACCESS] Résolution LID impossible:', error?.message || error);
+      }
+    }
+
+    const mongoAdmins = await loadAdminsFromMongo();
+    const access = resolveAccess({
+      identifiers: senderIdentifiers,
+      ownerValue: config.OWNER_NUMBER,
+      adminEntries: mongoAdmins,
+      sessionNumber: sanitizedBot
+    });
+    const isOwner = access.isConfiguredOwner;
+    const { isSessionOwner, isMongoAdmin, isPrivileged } = access;
+
+    // En mode privé, les propriétaires et admins Mongo restent autorisés.
+    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged) {
       await handleIgnoredMessage(socket, msg, sessionCfg);
       return;
     }
@@ -1585,6 +1710,10 @@ function setupCommandHandlers(socket, number) {
         args,
         body,
         isOwner,
+        isSessionOwner,
+        isMongoAdmin,
+        isPrivileged,
+        access,
         config,
         sessionCfg,
         prefix,
@@ -1699,10 +1828,10 @@ case 'status': {
       case 'mode': {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
 
   // Vérification de sécurité (seul le owner ou la session modifie)
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  if (!(isOwner || isSessionOwner)) {
     return await socket.sendMessage(from, { text: '❌ Seul le propriétaire peut changer le mode du bot.' }, { quoted: msg });
   }
 
@@ -3394,10 +3523,10 @@ case 'antitag': {
 case 'delsession': {
   try {
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     // Vérification : seul le Owner global peut utiliser cette commande
-    if (senderNum !== ownerNum) {
+    if (!isOwner) {
       await socket.sendMessage(sender, {
         text: '❌ Seul le propriétaire global du bot peut utiliser cette commande.'
       }, { quoted: msg });
@@ -3615,10 +3744,10 @@ case 'config': {
     const param = args.slice(1).join(' ').trim();
     const sanitized = (number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     // permission : seul le propriétaire de la session ou le bot owner peut modifier
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       const shonux = {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CONFIG_DENY1" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nEND:VCARD` } }
@@ -4143,7 +4272,7 @@ case 'antistatusmention': {
   try {
     const sanitized = String(number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     if (!from.endsWith('@g.us')) {
       return await socket.sendMessage(sender, {
@@ -4151,7 +4280,7 @@ case 'antistatusmention': {
       }, { quoted: msg });
     }
 
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       return await socket.sendMessage(sender, {
         text: '❌ Seul le propriétaire de la session ou du bot peut changer ce mode.'
       }, { quoted: msg });
@@ -4698,7 +4827,7 @@ VERSION:3.0
 N:${botName};;;;
 FN:${botName}
 ORG:KAIDO-MD
-TEL;type=CELL;type=VOICE;waid=${config.OWNER_NUMBER.replace(/[^0-9]/g,'')}:${config.OWNER_NUMBER}
+TEL;type=CELL;type=VOICE;waid=${primaryOwnerNumber()}:${config.OWNER_NUMBER}
 END:VCARD`
         }
       }
@@ -4707,10 +4836,10 @@ END:VCARD`
     // Déterminer l'émetteur (JID et numéro)
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
     const senderNum = (String(senderJid || '').split('@')[0] || '').replace(/[^0-9]/g, '');
-    const ownerNum = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     // Autorisation : seul le propriétaire de la session ou le bot owner peut forcer le bot à quitter
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       // Message en français indiquant la restriction
       await socket.sendMessage(from, {
         text: '❌ Seul le propriétaire de cette session ou le propriétaire du bot peut demander au bot de quitter le groupe.'
@@ -5074,8 +5203,8 @@ case 'setconfig': {
   try {
     // permission : seul le propriétaire de la session (number) ou le bot owner peut modifier
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = (config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    const ownerNum = primaryOwnerNumber();
+    if (!(isOwner || isSessionOwner)) {
       const meta = {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_SETCONFIG_DENIED" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY } }
@@ -5172,8 +5301,8 @@ case 'resetconfig': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   try {
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = (config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    const ownerNum = primaryOwnerNumber();
+    if (!(isOwner || isSessionOwner)) {
       const meta = {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_RESET_DENIED" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY } }
@@ -5569,9 +5698,9 @@ case 'ad': {
   try {
     const sanitized = String(number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum  = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum  = primaryOwnerNumber();
 
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       await socket.sendMessage(sender, {
         text: `❌ Seul le propriétaire de la session peut modifier ce paramètre.`
       }, { quoted: msg });
@@ -6292,58 +6421,47 @@ case 'add': {
 
 case 'firstadmin': {
   try {
-    const args = body.trim().split(' ');
-    
-    if (args.length < 4) {
-      await socket.sendMessage(sender, { 
-        text: "🔐 **INITIALISATION ADMIN** 🔐\n\n" +
-              "❌ Format : !firstadmin <password> <numéro> <nom>\n" +
-              "💡 Exemple : !firstadmin AdminInit123 50912345678 Super Admin"
+    // L'ancien mot de passe statique a été supprimé. Seul un propriétaire
+    // reconnu peut initialiser le premier admin.
+    if (!(isOwner || isSessionOwner)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Seul le propriétaire du bot ou de la session peut initialiser un administrateur.'
       }, { quoted: msg });
       break;
     }
-    
-    const password = args[1];
-    const numero = args[2];
-    const nom = args.slice(3).join(' ');
-    
-    // Mot de passe temporaire (à changer après usage)
-    const TEMP_PASSWORD = 'admin123';
-    
-    if (password !== TEMP_PASSWORD) {
-      await socket.sendMessage(sender, { 
-        text: "❌ Mot de passe incorrect.\n" +
-              "Contactez le développeur pour obtenir le mot de passe d'initialisation."
+
+    const firstAdminArgs = body.trim().split(/\s+/);
+    if (firstAdminArgs.length < 3) {
+      await socket.sendMessage(sender, {
+        text: `🔐 *INITIALISATION ADMIN* 🔐\n\n❌ Format : ${prefix}firstadmin <numéro> <nom>\n💡 Exemple : ${prefix}firstadmin 50912345678 Super Admin`
       }, { quoted: msg });
       break;
     }
-    
+
+    const numero = firstAdminArgs[1];
+    const nom = firstAdminArgs.slice(2).join(' ');
+
     // Vérifier si des admins existent déjà
     const existingAdmins = await loadAdminsFromMongo();
     if (existingAdmins.length > 0) {
-      await socket.sendMessage(sender, { 
-        text: "⚠️ Des administrateurs existent déjà.\n" +
-              "Utilisez !addadmin après vous être connecté en tant qu'admin."
+      await socket.sendMessage(sender, {
+        text: `⚠️ Des administrateurs existent déjà.\nUtilisez ${prefix}addadmin pour en ajouter d'autres.`
       }, { quoted: msg });
       break;
     }
-    
+
     const numeroNettoye = numero.replace(/[^0-9]/g, '');
-    const jid = `${numeroNettoye}@s.whatsapp.net`;
-    
-    // Ajouter l'admin directement (sans vérification)
+    const jid = await addAdminToMongo(numeroNettoye);
     await adminsCol.updateOne(
-      { jid }, 
-      { 
-        $set: { 
-          jid, 
-          name: nom, 
-          addedAt: new Date(), 
-          addedBy: 'first_init',
-          isSuperAdmin: true 
-        } 
-      }, 
-      { upsert: true }
+      { jid },
+      {
+        $set: {
+          name: nom,
+          addedAt: new Date(),
+          addedBy: nowsender,
+          isSuperAdmin: true
+        }
+      }
     );
     
     console.log(`🎉 Premier admin initialisé : ${nom} (${jid})`);
@@ -6387,14 +6505,8 @@ case 'firstadmin': {
 
 case 'breact': {
   try {
-    // Vérification admin
-    const admins = await loadAdminsFromMongo();
-    const senderJid = nowsender;
-    const isAdmin = admins.some(adminJid => 
-      adminJid === senderJid || adminJid === senderJid.split('@')[0]
-    );
-    
-    if (!isAdmin) {
+    // Les propriétaires et les admins Mongo partagent ce droit global.
+    if (!isPrivileged) {
       await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
       await socket.sendMessage(sender, { 
         text: "❌ Accès refusé. Cette commande est réservée aux administrateurs." 
@@ -6728,10 +6840,10 @@ case 'deleteme': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   // determine who sent the command
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
 
   // Permission: only the session owner or the bot OWNER can delete this session
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  if (!(isOwner || isSessionOwner)) {
     await socket.sendMessage(sender, { text: '❌ Permission denied. Only the session owner or the bot owner can delete this session.' }, { quoted: msg });
     break;
   }
@@ -6793,22 +6905,9 @@ case 'deletemenumber': {
 
   // Permission check: only OWNER or configured admins can run this
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
 
-  let allowed = false;
-  if (senderNum === ownerNum) allowed = true;
-  else {
-    try {
-      const adminList = await loadAdminsFromMongo();
-      if (Array.isArray(adminList) && adminList.some(a => a.replace(/[^0-9]/g,'') === senderNum || a === senderNum || a === `${senderNum}@s.whatsapp.net`)) {
-        allowed = true;
-      }
-    } catch (e) {
-      console.warn('Failed checking admin list', e);
-    }
-  }
-
-  if (!allowed) {
+  if (!isPrivileged) {
     await socket.sendMessage(sender, { text: '❌ Permission denied. Only bot owner or admins can delete other sessions.' }, { quoted: msg });
     break;
   }
@@ -6875,11 +6974,8 @@ case 'deletemenumber': {
 case 'cfn': {
   const fs = require('fs');
 
-  // Nettoyer le numéro de l’expéditeur
-  const sanitized = (senderNumber || '').replace(/[^0-9]/g, '');
-  const cfg = await loadUserConfigFromMongo(sanitized) || {};
-  const botName = cfg.botName || BOT_NAME_FANCY;
-  const logo = cfg.logo || config.RCD_IMAGE_PATH;
+  const botName = sessionCfg.botName || BOT_NAME_FANCY;
+  const logo = sessionCfg.logo || config.RCD_IMAGE_PATH;
 
   // Récupérer les arguments après la commande
   const full = args.join(" ").trim();
@@ -6890,12 +6986,9 @@ case 'cfn': {
     break;
   }
 
-  // Vérifier permissions
-  const admins = await loadAdminsFromMongo();
-  const normalizedAdmins = (admins || []).map(a => (a || '').toString());
+  // Vérifier permissions avec les identités owner/admin Mongo normalisées.
   const senderIdSimple = (senderNumber || '').toString();
-  const isAdmin = normalizedAdmins.includes(sender) || normalizedAdmins.includes(senderNumber) || normalizedAdmins.includes(senderIdSimple);
-  if (!(isOwner || isAdmin)) {
+  if (!isPrivileged) {
     await socket.sendMessage(sender, { text: '❌ Permission refusée. Seul le propriétaire ou les admins configurés peuvent ajouter des chaînes.' }, { quoted: msg });
     break;
   }
@@ -6917,26 +7010,20 @@ case 'cfn': {
     }
   }
 
-  const jid = jidPart;
-  if (!jid || !jid.endsWith('@newsletter')) {
+  const jid = normaliseNewsletterJid(jidPart);
+  if (!jid) {
     await socket.sendMessage(sender, { text: '❗ JID invalide. Exemple: 120363402094635383@newsletter' }, { quoted: msg });
     break;
   }
 
-  let emojis = [];
-  if (emojisPart) {
-    emojis = emojisPart.includes(',') ? emojisPart.split(',').map(e => e.trim()) : emojisPart.split(/\s+/).map(e => e.trim());
-    if (emojis.length > 20) emojis = emojis.slice(0, 20);
-  }
+  const emojis = normaliseEmojiList(emojisPart);
 
   try {
-    if (typeof socket.newsletterFollow === 'function') {
-      await socket.newsletterFollow(jid);
-    }
-
     await addNewsletterToMongo(jid, emojis);
+    const syncResults = await syncNewsletterSockets(activeSockets, jid, 'follow', [socket]);
 
-    const emojiText = emojis.length ? emojis.join(' ') : '(ensemble par défaut)';
+    const emojiText = emojis.length ? emojis.join(' ') : `(défaut : ${DEFAULT_NEWSLETTER_EMOJIS.join(' ')})`;
+    const syncedSessions = syncResults.filter(result => result.ok).length;
 
     const metaQuote = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CFN" },
@@ -6947,10 +7034,10 @@ case 'cfn': {
 
     await socket.sendMessage(sender, {
       image: imagePayload,
-      caption: `✅ Chaîne suivie et sauvegardée !\n\nJID: ${jid}\nEmojis: ${emojiText}\nAjouté par: @${senderIdSimple}`,
+      caption: `✅ Chaîne suivie et sauvegardée !\n\nJID: ${jid}\nEmojis: ${emojiText}\nSessions synchronisées: ${syncedSessions}\nAjouté par: @${senderIdSimple}`,
       footer: `📌 ${botName} FOLLOW CHANNEL`,
-      mentions: [sender], 
-      buttons: [{ buttonId: `${config.PREFIX}menu`, buttonText: { displayText: "📋 MENU" }, type: 1 }],
+      mentions: [nowsender],
+      buttons: [{ buttonId: `${prefix}menu`, buttonText: { displayText: "📋 MENU" }, type: 1 }],
       headerType: 4
     }, { quoted: metaQuote });
 
@@ -7941,14 +8028,8 @@ case 'bots': {
     const cfg = await loadUserConfigFromMongo(sanitized) || {};
     const botName = cfg.botName || BOT_NAME_FANCY;
 
-    // Vérification admin
-    const admins = await loadAdminsFromMongo();
-    const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
-    const isAdmin = admins.some(admin => 
-      admin === nowsender || admin.includes(senderIdSimple)
-    );
-
-    if (!isAdmin) {
+    // Vérification owner/admin Mongo déjà normalisée au début du handler.
+    if (!isPrivileged) {
       await socket.sendMessage(sender, { 
         text: '❌ Accès réservé aux administrateurs.' 
       }, { quoted: msg });
@@ -8186,9 +8267,9 @@ case 'ig': {
   try {
     const sanitized = (number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
     // permission : seul le propriétaire de la session ou le bot owner peut utiliser
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       return await socket.sendMessage(sender, { text: '❌ Permission denied. Only the session owner or bot owner can use this command.' }, { quoted: msg });
     }
 
@@ -8969,8 +9050,8 @@ END:VCARD`;
   break;
 }
         case 'unfollow': {
-  const jid = args[0] ? args[0].trim() : null;
-  if (!jid) {
+  const requestedJid = args[0] ? args[0].trim() : null;
+  if (!requestedJid) {
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
     const title = userCfg.botName || 'NIKKA MINI BOT AI';
@@ -8983,11 +9064,7 @@ END:VCARD`;
     return await socket.sendMessage(sender, { text: '❗ Provide channel JID to unfollow. Example:\n.unfollow 120363396379901844@newsletter' }, { quoted: shonux });
   }
 
-  const admins = await loadAdminsFromMongo();
-  const normalizedAdmins = admins.map(a => (a || '').toString());
-  const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
-  const isAdmin = normalizedAdmins.includes(nowsender) || normalizedAdmins.includes(senderNumber) || normalizedAdmins.includes(senderIdSimple);
-  if (!(isOwner || isAdmin)) {
+  if (!isPrivileged) {
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
     const title = userCfg.botName || 'NIKKA MINI BOT AI';
@@ -8998,7 +9075,8 @@ END:VCARD`;
     return await socket.sendMessage(sender, { text: '❌ Permission denied. Only owner or admins can remove channels.' }, { quoted: shonux });
   }
 
-  if (!jid.endsWith('@newsletter')) {
+  const jid = normaliseNewsletterJid(requestedJid);
+  if (!jid) {
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
     const title = userCfg.botName || 'NIKKA MINI BOT AI';
@@ -9010,10 +9088,8 @@ END:VCARD`;
   }
 
   try {
-    if (typeof socket.newsletterUnfollow === 'function') {
-      await socket.newsletterUnfollow(jid);
-    }
     await removeNewsletterFromMongo(jid);
+    await syncNewsletterSockets(activeSockets, jid, 'unfollow', [socket]);
 
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
@@ -10247,10 +10323,10 @@ case 'jid': {
 case 'setpath': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
   
   // Vérification des permissions
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  if (!(isOwner || isSessionOwner)) {
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH1" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
@@ -10390,8 +10466,8 @@ case 'showconfig': {
 case 'resetconfig': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  const ownerNum = primaryOwnerNumber();
+  if (!(isOwner || isSessionOwner)) {
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_RESETCONFIG1" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
@@ -10453,7 +10529,7 @@ async function deleteSessionAndCleanup(number, socketInstance) {
     try { await removeSessionFromMongo(sanitized); } catch(e){}
     try { await removeNumberFromMongo(sanitized); } catch(e){}
     try {
-      const ownerJid = `${config.OWNER_NUMBER.replace(/[^0-9]/g,'')}@s.whatsapp.net`;
+      const ownerJid = `${primaryOwnerNumber()}@s.whatsapp.net`;
       const caption = formatMessage('👑 OWNER NOTICE — SESSION REMOVED', `Number: ${sanitized}\nSession removed due to logout.\n\nActive sessions now: ${activeSockets.size}`, BOT_NAME_FANCY);
       if (socketInstance && socketInstance.sendMessage) await socketInstance.sendMessage(ownerJid, { image: { url: config.RCD_IMAGE_PATH }, caption });
     } catch(e){}
@@ -10734,22 +10810,33 @@ Le bot est maintenant connecté et fonctionnel.`,
 // ---------------- endpoints (admin/newsletter management + others) ----------------
 
 router.post('/newsletter/add', async (req, res) => {
-  const { jid, emojis } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
-  if (!jid.endsWith('@newsletter')) return res.status(400).send({ error: 'Invalid newsletter jid' });
+  const jid = normaliseNewsletterJid(req.body?.jid);
+  const emojis = normaliseEmojiList(req.body?.emojis);
+  if (!jid) return res.status(400).send({ error: 'JID de chaîne invalide' });
   try {
-    await addNewsletterToMongo(jid, Array.isArray(emojis) ? emojis : []);
-    res.status(200).send({ status: 'ok', jid });
+    const saved = await addNewsletterToMongo(jid, emojis);
+    const synchronization = await syncNewsletterSockets(activeSockets, jid, 'follow');
+    res.status(200).send({
+      status: 'ok',
+      ...saved,
+      synchronized: synchronization.filter(result => result.ok).length,
+      failures: synchronization.filter(result => !result.ok && !result.skipped)
+    });
   } catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
 
 router.post('/newsletter/remove', async (req, res) => {
-  const { jid } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
+  const jid = normaliseNewsletterJid(req.body?.jid);
+  if (!jid) return res.status(400).send({ error: 'JID de chaîne invalide' });
   try {
     await removeNewsletterFromMongo(jid);
-    res.status(200).send({ status: 'ok', jid });
+    const synchronization = await syncNewsletterSockets(activeSockets, jid, 'unfollow');
+    res.status(200).send({
+      status: 'ok',
+      jid,
+      synchronized: synchronization.filter(result => result.ok).length
+    });
   } catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
@@ -10768,9 +10855,9 @@ router.post('/admin/add', async (req, res) => {
   const { jid } = req.body;
   if (!jid) return res.status(400).send({ error: 'jid required' });
   try {
-    await addAdminToMongo(jid);
-    res.status(200).send({ status: 'ok', jid });
-  } catch (e) { res.status(500).send({ error: e.message || e }); }
+    const normalizedJid = await addAdminToMongo(jid);
+    res.status(200).send({ status: 'ok', jid: normalizedJid });
+  } catch (e) { res.status(400).send({ error: e.message || e }); }
 });
 
 

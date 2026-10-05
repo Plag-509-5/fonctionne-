@@ -7,11 +7,14 @@ function cleanNumber(value) {
   return String(value || '').replace(/[^0-9]/g, '');
 }
 
-function canManageConfig({ senderNumber, sessionNumber, config, isOwner }) {
+function canManageConfig({ senderNumber, sessionNumber, config, isOwner, isSessionOwner, isMongoAdmin }) {
   const sender = cleanNumber(senderNumber);
   const session = cleanNumber(sessionNumber);
-  const owner = cleanNumber(config?.OWNER_NUMBER);
-  return Boolean(isOwner || (sender && (sender === session || sender === owner)));
+  const owners = String(config?.OWNER_NUMBER || '')
+    .split(/[,;|]+/)
+    .map(cleanNumber)
+    .filter(Boolean);
+  return Boolean(isOwner || isSessionOwner || isMongoAdmin || (sender && (sender === session || owners.includes(sender))));
 }
 
 async function send(socket, from, msg, text) {
@@ -37,7 +40,7 @@ module.exports = {
     } = context;
 
     if (!canManageConfig(context)) {
-      return send(socket, from, msg, '❌ Seuls le propriétaire de la session ou le propriétaire du bot peuvent modifier cette configuration.');
+      return send(socket, from, msg, '❌ Seuls le propriétaire de la session, le propriétaire du bot ou un admin Mongo peuvent modifier cette configuration.');
     }
     if (typeof setUserConfigInMongo !== 'function') {
       throw new Error('Le stockage de configuration est indisponible.');

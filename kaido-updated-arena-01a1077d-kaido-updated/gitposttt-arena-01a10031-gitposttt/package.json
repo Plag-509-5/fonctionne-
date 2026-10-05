@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
-    "test:syntax": "node --check pair.js && node --check youtube.js && node --check services/command-routing.js && node --check services/presence-mode.js && node --check services/media-api.js && node --check services/image-search.js && node --check services/telegram-stickers.js && node --check plugins/owner/config.js && node --check plugins/general/menu.js && node --check plugins/download/youtube.js && node --check plugins/download/instagram.js && node --check plugins/download/facebook.js && node --check plugins/tools/img.js && node --check plugins/tools/tgs.js"
+    "test:syntax": "node --check index.js && node --check config.js && node --check pair.js && node --check youtube.js && node --check services/access-control.js && node --check services/dashboard-auth.js && node --check services/newsletter-config.js && node --check services/command-routing.js && node --check services/presence-mode.js && node --check services/media-api.js && node --check services/image-search.js && node --check services/telegram-stickers.js && node --check plugins/owner/config.js && node --check plugins/general/menu.js && node --check plugins/download/youtube.js && node --check plugins/download/instagram.js && node --check plugins/download/facebook.js && node --check plugins/tools/img.js && node --check plugins/tools/tgs.js"
   },
   "dependencies": {
     "@blackamda/telegram-image-url": "1.0.0",
