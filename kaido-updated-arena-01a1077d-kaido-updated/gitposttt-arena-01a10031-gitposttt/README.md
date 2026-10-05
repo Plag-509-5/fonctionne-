@@ -109,6 +109,27 @@ Le serveur démarrera sur `http://localhost:3000` :
 
 ---
 
+## 📴 Présence et mode sans préfixe
+
+Chaque session peut être configurée directement dans WhatsApp par le propriétaire :
+
+```text
+.config alwaysonline on
+.config alwaysonline off
+.config setprefix !
+.config setprefix off
+```
+
+- `alwaysonline on` garde la présence du compte disponible.
+- `alwaysonline off` applique la présence `unavailable`. Un message ordinaire est ignoré sans appel à `readMessages`; une commande reconnue est marquée comme lue, réveille temporairement le bot, puis celui-ci repasse hors ligne.
+- `setprefix off` enregistre un préfixe vide. Dans ce mode, le bot examine uniquement le premier mot : `menu` est exécuté, tandis que `bonjour menu` ou un mot inconnu sont ignorés silencieusement.
+- Pour réactiver le point depuis le mode sans préfixe : `config setprefix .`.
+- `.config show` affiche les valeurs actives de la session.
+
+> **Limite WhatsApp :** un seul coche signifie que le message n’a pas encore été livré au compte/appareil connecté. Le bot doit recevoir le message pour savoir si son premier mot est une commande; il ne peut donc pas garantir un seul coche tout en effectuant cette détection. En mode OFF, il évite l’accusé de **lecture** des textes ordinaires, mais WhatsApp peut tout de même afficher deux coches grises de livraison. Les coches bleues dépendent aussi des réglages de confidentialité WhatsApp.
+
+---
+
 ## 🔌 Ajouter un Plugin (Rechargement 100% Automatique)
 
 Pour ajouter une nouvelle commande, créez simplement un fichier `.js` dans `plugins/` (ou un sous-dossier) :

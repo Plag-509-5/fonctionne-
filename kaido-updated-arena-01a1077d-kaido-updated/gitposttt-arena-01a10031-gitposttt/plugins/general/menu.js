@@ -21,6 +21,9 @@ module.exports = {
     const dateHaiti = moment().tz('America/Port-au-Prince').format('DD/MM/YYYY');
     const uptime = formatUptime(process.uptime());
     const mode = sessionCfg?.MODE || 'public';
+    const prefixLabel = prefix
+      ? `[ *${prefix}* ]`
+      : '*Aucun — mode prefixless*';
 
     const categories = getPluginsByCategory ? getPluginsByCategory() : {};
 
@@ -42,8 +45,8 @@ module.exports = {
 ⚙️ *Mode :* ${mode.toUpperCase()}
 🕒 *Heure :* ${timeHaiti} (${dateHaiti})
 ⏱️ *Uptime :* ${uptime}
-📌 *Préfixe :* [ *${prefix}* ]
-
+📌 *Préfixe :* ${prefixLabel}
+${prefix ? '' : '🔎 *Prefixless :* seul un premier mot correspondant exactement à une commande est exécuté.\n'}
 `;
 
     let totalCommands = 0;

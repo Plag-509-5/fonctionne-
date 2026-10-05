@@ -13,7 +13,18 @@ const axios = require('axios');
 const FileType = require('file-type');
 const fetch = require('node-fetch');
 const { MongoClient } = require('mongodb');
-const { loadPlugins, executePlugin, getPluginsByCategory, getAllPluginsList } = require('./pluginLoader');
+const { loadPlugins, executePlugin, getPlugins, getPluginsByCategory, getAllPluginsList } = require('./pluginLoader');
+const {
+  resolveSessionPrefix,
+  parseCommandInput,
+  extractMainCommandNames
+} = require('./services/command-routing');
+const {
+  configEnabled,
+  handleIgnoredMessage,
+  wakeForCommand,
+  applyAlwaysOnlineSetting
+} = require('./services/presence-mode');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('./files/sticker_cmd');
 const { findReactionCommand, initReactionDb } = require('./files/reaction_cmd');
@@ -82,6 +93,33 @@ const DEFAULT_SESSION_CONFIG = {
   ANTI_TAG_MODE: true,
   MODE: 'public'
 };
+
+// En mode prefixless, seuls les noms réellement connus doivent réveiller le bot.
+// Le switch principal contient un sous-switch pour `.config`; ses options ne sont
+// donc pas des commandes autonomes et sont retirées du registre historique.
+const CONFIG_ONLY_SUBCOMMANDS = new Set([
+  'alwaysonline', 'autoonline', 'online',
+  'autoview', 'autolike', 'autorec', 'setemoji', 'setlikeemoji',
+  'setprefix', 'show', 'get'
+]);
+const LEGACY_COMMANDS = (() => {
+  try {
+    const source = fs.readFileSync(__filename, 'utf8');
+    return extractMainCommandNames(source, CONFIG_ONLY_SUBCOMMANDS);
+  } catch (error) {
+    console.warn('[COMMAND REGISTRY] Impossible de lire les commandes historiques:', error.message);
+    return new Set();
+  }
+})();
+
+function isKnownCommandName(command) {
+  const name = String(command || '').toLowerCase();
+  return getPlugins().has(name) || LEGACY_COMMANDS.has(name);
+}
+
+const SESSION_CONFIG_CACHE_TTL_MS = 5_000;
+const sessionConfigCache = new Map();
+
 const config = {
   MAX_RETRIES: 3,
   GROUP_INVITE_LINK: 'https://chat.whatsapp.com/DLK3kh1Ze2qHUfNKCZ3iXN?mode=gi_t',
@@ -280,9 +318,22 @@ async function saveNewsletterReaction(jid, messageId, emoji, sessionNumber) {
 async function setUserConfigInMongo(number, conf) {
   try {
     await initMongo();
-    const sanitized = number.replace(/[^0-9]/g, '');
-    await configsCol.updateOne({ number: sanitized }, { $set: { number: sanitized, config: conf, updatedAt: new Date() } }, { upsert: true });
-  } catch (e) { console.error('setUserConfigInMongo', e); }
+    const sanitized = String(number || '').replace(/[^0-9]/g, '');
+    if (!sanitized) throw new Error('Numéro de session invalide');
+    await configsCol.updateOne(
+      { number: sanitized },
+      { $set: { number: sanitized, config: conf, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    sessionConfigCache.set(sanitized, {
+      value: { ...DEFAULT_SESSION_CONFIG, ...(conf || {}) },
+      expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
+    });
+    return true;
+  } catch (e) {
+    console.error('setUserConfigInMongo', e);
+    return false;
+  }
 }
 
 async function loadUserConfigFromMongo(number) {
@@ -294,13 +345,20 @@ async function loadUserConfigFromMongo(number) {
   } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
 }
 
-async function loadSessionConfigMerged(number) {
-  const sanitized = String(number).replace(/[^0-9]/g, '');
-  // charge la config brute depuis la DB
+async function loadSessionConfigMerged(number, forceRefresh = false) {
+  const sanitized = String(number || '').replace(/[^0-9]/g, '');
+  if (!sanitized) return { ...DEFAULT_SESSION_CONFIG };
+
+  const cached = sessionConfigCache.get(sanitized);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return { ...cached.value };
+
   const dbCfg = await loadUserConfigFromMongo(sanitized) || {};
-  // fusionne : les valeurs en DB écrasent les defaults
   const merged = { ...DEFAULT_SESSION_CONFIG, ...dbCfg };
-  return merged;
+  sessionConfigCache.set(sanitized, {
+    value: merged,
+    expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
+  });
+  return { ...merged };
 }
 
 // Helpers Mongo pour persister le schedule
@@ -790,16 +848,12 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
     console.log('[HANDLER] merged cfg for', sessionId, cfg);
 
     try {
-      if (cfg.AUTO_ONLINE) {
+      if (configEnabled(cfg.AUTO_ONLINE, false)) {
         console.log('[HANDLER] AUTO_ONLINE -> sending available presence');
         await socket.sendPresenceUpdate('available', message.key.remoteJid);
-        setTimeout(async () => {
-          try { await socket.sendPresenceUpdate('unavailable', message.key.remoteJid); }
-          catch (e) { console.warn('[HANDLER] presence revert failed', e); }
-        }, 5000);
       }
 
-      if (cfg.AUTO_RECORDING) {
+      if (configEnabled(cfg.AUTO_ONLINE, false) && configEnabled(cfg.AUTO_RECORDING, false)) {
         await socket.sendPresenceUpdate('recording', message.key.remoteJid);
       }
 
@@ -1192,6 +1246,7 @@ function setupCommandHandlers(socket, number) {
     
     const remoteJid = msg.key.remoteJid;
     if (!remoteJid) return;
+    if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
     
     // 2. Déterminer le type de message pour extraire le body
     const type = getContentType(msg.message);
@@ -1223,7 +1278,8 @@ function setupCommandHandlers(socket, number) {
           return;
         }
 
-        const cmdPrefix = config.PREFIX || '.';
+        await wakeForCommand(socket, msg, sessionCfg);
+        const cmdPrefix = resolveSessionPrefix(sessionCfg, config.PREFIX || '.');
         const fullCmdStr = matchedReactCmd.command;
         const fullBody = `${cmdPrefix}${fullCmdStr}`;
         const cmdName = fullCmdStr.split(' ')[0].toLowerCase();
@@ -1264,6 +1320,7 @@ function setupCommandHandlers(socket, number) {
           from: targetChat,
           sender: reactorJid,
           senderNumber: reactorNumber,
+          sessionNumber: String(number || sanitizedBot).replace(/[^0-9]/g, ''),
           args: cmdArgs,
           body: fullBody,
           isOwner: isReactorOwner,
@@ -1276,7 +1333,9 @@ function setupCommandHandlers(socket, number) {
           quotedSender: quotedParticipant,
           activeSockets,
           loadUserConfigFromMongo,
-          setUserConfigInMongo
+          setUserConfigInMongo,
+          getPluginsByCategory,
+          getAllPluginsList
         });
 
         if (isHandled) return;
@@ -1310,7 +1369,8 @@ function setupCommandHandlers(socket, number) {
     if (stickerMsgObj) {
       const matchedCmd = findStickerCommand(stickerMsgObj);
       if (matchedCmd && matchedCmd.command) {
-        const cmdPrefix = config.PREFIX || '.';
+        const stickerCfg = await loadSessionConfigMerged(number || socket.user?.id);
+        const cmdPrefix = resolveSessionPrefix(stickerCfg, config.PREFIX || '.');
         body = `${cmdPrefix}${matchedCmd.command}`;
         console.log(`🎯 [STICKER-CMD] Sticker identifié ! Déclenchement automatique de : "${body}"`);
 
@@ -1434,48 +1494,54 @@ function setupCommandHandlers(socket, number) {
     }
     // --- FIN ANTI-TAG ---
 
-    // Si pas de texte, on ne peut pas traiter de commande
-    if (!body || typeof body !== 'string') return;
+    // Si le message ne contient pas de texte, il est ignoré sans accusé de lecture.
+    if (!body || typeof body !== 'string') {
+      await handleIgnoredMessage(socket, msg, cfg);
+      return;
+    }
+
     const tttFrom = remoteJid;
-    const tttSender = msg.key.fromMe 
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id) 
+    const tttSender = msg.key.fromMe
+      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
       : (msg.key.participant || remoteJid);
 
     const isTttMove = await handleTicTacToeMove(socket, msg, tttFrom, tttSender, body);
-    if (isTttMove) return; // Si c'est un coup valide, on stoppe le code ici pour ne pas chercher de commande
-    // ──────────── 
-    // 4. Vérifier si c'est une commande
-    const prefix = config.PREFIX || '.';
-    const isCmd = body && body.startsWith && body.startsWith(prefix);
-    if (!isCmd) return; // Si ce n'est pas une commande, on arrête
-    
-    const command = body.slice(prefix.length).trim().split(' ').shift().toLowerCase();
-    const args = body.trim().split(/ +/).slice(1);
-    
+    if (isTttMove) {
+      await wakeForCommand(socket, msg, cfg);
+      return;
+    }
+
+    // 4. Résoudre le préfixe de cette session. Une chaîne vide signifie
+    // "prefixless" et impose une validation du premier mot dans le registre.
+    const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
+    const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
+    if (!parsedCommand) {
+      await handleIgnoredMessage(socket, msg, cfg);
+      return;
+    }
+    const { command, args } = parsedCommand;
+
     // 5. Récupérer les informations d'expéditeur
     const from = remoteJid;
     const sender = from;
-    const nowsender = msg.key.fromMe 
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id) 
+    const nowsender = msg.key.fromMe
+      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
       : (msg.key.participant || remoteJid);
     const senderNumber = (nowsender || '').split('@')[0];
     const botNumber = socket.user.id ? socket.user.id.split(':')[0] : '';
+    const sanitizedBot = String(number || botNumber || '').replace(/[^0-9]/g, '');
+    const sessionCfg = cfg;
     const isOwner = senderNumber === config.OWNER_NUMBER.replace(/[^0-9]/g, '');
-    try {
-      // On récupère la configuration de la session en utilisant le botNumber (nettoyé de manière sûre)
-      const sanitizedBot = String(botNumber || '').replace(/[^0-9]/g, '');
-      const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
 
-      // Si la session est configurée sur "private"
-      if (sessionCfg && sessionCfg.MODE === 'private') {
-        // Si l'envoyeur n'est ni le propriétaire (isOwner) ni le compte du bot lui-même
-        if (!isOwner && senderNumber !== sanitizedBot) {
-          return; // On ignore silencieusement le message, le bot ne répondra à rien
-        }
-      }
-    } catch (err) {
-      console.error("Erreur lors de la vérification du mode de session:", err);
+    // En mode privé, une commande non autorisée reste silencieuse et non lue.
+    if (sessionCfg && sessionCfg.MODE === 'private' && !isOwner && senderNumber !== sanitizedBot) {
+      await handleIgnoredMessage(socket, msg, sessionCfg);
+      return;
     }
+
+    // En AUTO_ONLINE OFF, seule une commande reconnue arrive ici : elle est
+    // explicitement marquée comme lue et réveille temporairement la présence.
+    await wakeForCommand(socket, msg, sessionCfg);
     // DEBUG: Afficher les informations pour le débogage
     console.log('DEBUG Command Handler:');
     console.log('- Remote JID:', remoteJid);
@@ -1509,14 +1575,13 @@ function setupCommandHandlers(socket, number) {
 
     // ── Exécution des plugins modulaires ──
     try {
-      const sanitizedBot = String(botNumber || '').replace(/[^0-9]/g, '');
-      const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
       const isHandled = await executePlugin(command, {
         socket,
         msg,
         from,
         sender: nowsender,
         senderNumber,
+        sessionNumber: sanitizedBot,
         args,
         body,
         isOwner,
@@ -1526,7 +1591,9 @@ function setupCommandHandlers(socket, number) {
         command,
         activeSockets,
         loadUserConfigFromMongo,
-        setUserConfigInMongo
+        setUserConfigInMongo,
+        getPluginsByCategory,
+        getAllPluginsList
       });
       if (isHandled) return;
     } catch (pluginErr) {
@@ -3600,6 +3667,21 @@ case 'config': {
         break;
       }
 
+      case 'alwaysonline':
+      case 'autoonline':
+      case 'online': {
+        const val = (args[1] || '').toLowerCase();
+        if (val === 'on' || val === 'off') {
+          cfg.AUTO_ONLINE = val === 'on';
+          await setUserConfigInMongo(sanitized, cfg);
+          await applyAlwaysOnlineSetting(socket, cfg.AUTO_ONLINE, sender);
+          await socket.sendMessage(sender, { text: `✅ ALWAYS_ONLINE : ${val.toUpperCase()}` }, { quoted: msg });
+        } else {
+          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off` }, { quoted: msg });
+        }
+        break;
+      }
+
       case 'setemoji': {
         if (!param) {
           await socket.sendMessage(sender, { text: 'Usage: .config setemoji <emoji1> <emoji2> ...' }, { quoted: msg });
@@ -3618,14 +3700,19 @@ case 'config': {
       }
 
       case 'setprefix': {
-        const newPrefix = args[1] || '';
-        if (!newPrefix) {
-          await socket.sendMessage(sender, { text: 'Usage: .config setprefix <prefix>' }, { quoted: msg });
+        const requestedPrefix = args[1];
+        if (requestedPrefix === undefined) {
+          await socket.sendMessage(sender, { text: `${prefix}config setprefix <préfixe|off>` }, { quoted: msg });
           break;
         }
+        const newPrefix = /^(?:off|none|false)$/i.test(requestedPrefix) ? '' : requestedPrefix;
         cfg.PREFIX = newPrefix;
         await setUserConfigInMongo(sanitized, cfg);
-        await socket.sendMessage(sender, { text: `✅ PREFIX set to: ${newPrefix}` }, { quoted: msg });
+        await socket.sendMessage(sender, {
+          text: newPrefix
+            ? `✅ PREFIX set to: ${newPrefix}`
+            : '✅ Mode prefixless activé. Utilise `config setprefix .` pour réactiver le point.'
+        }, { quoted: msg });
         break;
       }
 
@@ -3636,8 +3723,9 @@ case 'config': {
           AUTO_VIEW_STATUS: typeof cfg.AUTO_VIEW_STATUS === 'undefined' ? true : cfg.AUTO_VIEW_STATUS,
           AUTO_LIKE_STATUS: typeof cfg.AUTO_LIKE_STATUS === 'undefined' ? true : cfg.AUTO_LIKE_STATUS,
           AUTO_RECORDING: typeof cfg.AUTO_RECORDING === 'undefined' ? false : cfg.AUTO_RECORDING,
+          AUTO_ONLINE: typeof cfg.AUTO_ONLINE === 'undefined' ? false : cfg.AUTO_ONLINE,
           AUTO_LIKE_EMOJI: Array.isArray(cfg.AUTO_LIKE_EMOJI) && cfg.AUTO_LIKE_EMOJI.length ? cfg.AUTO_LIKE_EMOJI : ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
-          PREFIX: cfg.PREFIX || '.',
+          PREFIX: Object.prototype.hasOwnProperty.call(cfg, 'PREFIX') ? cfg.PREFIX : '.',
           antidelete: cfg.antidelete === true
         };
         const text = [
@@ -3645,8 +3733,9 @@ case 'config': {
           `AUTO_VIEW_STATUS: ${merged.AUTO_VIEW_STATUS}`,
           `AUTO_LIKE_STATUS: ${merged.AUTO_LIKE_STATUS}`,
           `AUTO_RECORDING: ${merged.AUTO_RECORDING}`,
+          `AUTO_ONLINE: ${merged.AUTO_ONLINE}`,
           `AUTO_LIKE_EMOJI: ${merged.AUTO_LIKE_EMOJI.join(' ')}`,
-          `PREFIX: ${merged.PREFIX}`,
+          `PREFIX: ${merged.PREFIX || 'off (prefixless)'}`,
           `ANTIDELETE: ${merged.antidelete ? 'ON' : 'OFF'}`
         ].join('\n');
         await socket.sendMessage(sender, { text }, { quoted: msg });
@@ -3660,8 +3749,9 @@ case 'config': {
           '.config autoview on|off',
           '.config autolike on|off',
           '.config autorec on|off',
+          '.config alwaysonline on|off',
           '.config setlikeemoji <emoji1> <emoji2> ...',
-          '.config setprefix <prefix>',
+          '.config setprefix <prefix|off>',
           '.config show'
         ].join('\n');
         await socket.sendMessage(sender, { text: help }, { quoted: msg });
@@ -8462,7 +8552,6 @@ case 'swgc': {
     const jid = msg.key.remoteJid;
     const sender = msg.key.participant || msg.key.remoteJid;
     const isGroup = jid.endsWith('@g.us');
-    const prefix = config.PREFIX || '.';
     
     // IMPORTANT: On ne répond que dans le groupe ou en privé selon le contexte
     // Si c'est un groupe, on répond dans le groupe
@@ -10347,14 +10436,10 @@ case 'resetconfig': {
 
 // ---------------- message handlers ----------------
 
-function setupMessageHandlers(socket) {
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
-    if (config.AUTO_RECORDING === 'true') {
-      try { await socket.sendPresenceUpdate('recording', msg.key.remoteJid); } catch (e) {}
-    }
-  });
+function setupMessageHandlers() {
+  // La présence et les accusés de lecture sont gérés après reconnaissance de la
+  // commande dans setupCommandHandlers. Ne rien envoyer ici évite de réveiller
+  // le compte pour un message ordinaire lorsque AUTO_ONLINE est désactivé.
 }
 
 // ---------------- cleanup helper ----------------
@@ -10441,12 +10526,14 @@ async function EmpirePair(number, res) {
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
+  const initialSessionCfg = await loadSessionConfigMerged(sanitizedNumber).catch(() => ({ ...DEFAULT_SESSION_CONFIG }));
 
  try {
     const socket = makeWASocket({
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       printQRInTerminal: false,
       logger,
+      markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
       browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
@@ -10505,6 +10592,8 @@ handleMessageRevocation(socket, sanitizedNumber);
         reconnectAttempts.delete(sanitizedNumber);
         lastConnectionActivity.set(sanitizedNumber, Date.now());
         try {
+          const presenceCfg = await loadSessionConfigMerged(sanitizedNumber, true);
+          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
           const groupResult = await joinGroup(socket).catch(()=>({ status: 'failed', error: 'joinGroup not configured' }));
@@ -10560,7 +10649,7 @@ handleMessageRevocation(socket, sanitizedNumber);
 🔢 Numéro : ${sanitizedNumber}
 🕒 Connecté : ${getHaitiTimestamp()}
 
-Le bot est maintenant en ligne et fonctionnel.`,
+Le bot est maintenant connecté et fonctionnel.`,
   useBotName
 );
 
@@ -10595,6 +10684,7 @@ Le bot est maintenant en ligne et fonctionnel.`,
           //await sendAdminConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
          // await sendOwnerConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
           await addNumberToMongo(sanitizedNumber);
+          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
 
         } catch (e) { 
           console.error('Connection open error:', e); 
