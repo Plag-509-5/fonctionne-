@@ -85,7 +85,18 @@ OWNER_NUMBER=50947440869
 PREFIX=.
 ADMIN_PASS=adminplag
 MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net
+
+# Requis uniquement pour importer un pack avec .tgs
+# Créez gratuitement un bot avec @BotFather puis collez son token ici.
+TELEGRAM_BOT_TOKEN=
+
+# Facultatif : APIs de téléchargement personnalisées
+FACEBOOK_DOWNLOADER_API=https://fdown.isuru.eu.org
+COBALT_API_URLS=https://rue-cobalt.xenon.zone,https://cobaltapi.cjs.nz
+COBALT_API_KEY=
 ```
+
+> La page publique `t.me/addstickers/...` ne contient plus les fichiers `.tgs`. La commande `.tgs` utilise donc l’API officielle Telegram (`getStickerSet` puis `getFile`), ce qui nécessite `TELEGRAM_BOT_TOKEN`. Le token reste côté serveur et n’est jamais envoyé dans les messages ou les logs d’erreur.
 
 ### 4. Lancer le Bot
 ```bash
