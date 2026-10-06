@@ -39,6 +39,17 @@ const {
   resolveNewsletterEmojis,
   syncNewsletterSockets
 } = require('./services/newsletter-config');
+const {
+  modeAllowsChat,
+  normaliseAntideleteMode,
+  unwrapMessage: unwrapAntideleteMessage,
+  resolveOriginalAuthor,
+  resolveRevoker,
+  resolveConversationName,
+  uniqueMentions,
+  buildAntideleteHeader,
+  sendRecoveredMessage
+} = require('./services/antidelete');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('./files/sticker_cmd');
 const { findReactionCommand, initReactionDb } = require('./files/reaction_cmd');
@@ -659,41 +670,73 @@ const otpStore = new Map();
 // ANTIDELETE STORE — Store en mémoire par session
 // ============================================================
 const messageStores = new Map(); // sessionNumber → Map<msgId, msgObject>
+const messageStoreTimes = new Map(); // sessionNumber → Map<msgId, storedAt>
 
-const STORE_MAX_PER_SESSION = 500;  // quota max par session
-const STORE_CLEAN_INTERVAL  = 20 * 60 * 1000; // nettoyage toutes les 20 min
+const STORE_MAX_PER_SESSION = Math.max(500, Number(process.env.ANTIDELETE_STORE_MAX) || 1500);
+const STORE_RETENTION_MS = Math.max(20 * 60 * 1000, Number(process.env.ANTIDELETE_RETENTION_MS) || 24 * 60 * 60 * 1000);
+const STORE_CLEAN_INTERVAL = 20 * 60 * 1000;
 
 function getSessionStore(sessionNumber) {
-  if (!messageStores.has(sessionNumber)) {
-    messageStores.set(sessionNumber, new Map());
-  }
+  if (!messageStores.has(sessionNumber)) messageStores.set(sessionNumber, new Map());
+  if (!messageStoreTimes.has(sessionNumber)) messageStoreTimes.set(sessionNumber, new Map());
   return messageStores.get(sessionNumber);
+}
+
+function deleteStoredMessage(sessionNumber, msgId) {
+  getSessionStore(sessionNumber).delete(msgId);
+  messageStoreTimes.get(sessionNumber)?.delete(msgId);
+}
+
+function clearSessionStore(sessionNumber) {
+  getSessionStore(sessionNumber).clear();
+  messageStoreTimes.get(sessionNumber)?.clear();
 }
 
 function storeMessage(sessionNumber, msg) {
   if (!msg?.key?.id || !msg?.message) return;
-  const store = getSessionStore(sessionNumber);
+  // Un protocole REVOKE décrit une suppression : ce n'est pas le message
+  // original et il ne doit jamais remplacer une entrée du store.
+  if (unwrapAntideleteMessage(msg.message).message?.protocolMessage?.type === 0) return;
 
-  // Quota dépassé → vider les 100 plus anciens
-  if (store.size >= STORE_MAX_PER_SESSION) {
-    const keys = [...store.keys()].slice(0, 100);
-    keys.forEach(k => store.delete(k));
+  const store = getSessionStore(sessionNumber);
+  const times = messageStoreTimes.get(sessionNumber);
+
+  // Quota dépassé → supprimer les entrées les plus anciennes sans vider les
+  // conversations récentes. Les objets Baileys ne contiennent pas les buffers.
+  while (store.size >= STORE_MAX_PER_SESSION) {
+    const oldestKey = store.keys().next().value;
+    if (!oldestKey) break;
+    store.delete(oldestKey);
+    times.delete(oldestKey);
   }
 
+  // Réinsérer actualise aussi l'ordre LRU de la Map.
+  store.delete(msg.key.id);
   store.set(msg.key.id, msg);
+  times.set(msg.key.id, Date.now());
 }
 
 function getStoredMessage(sessionNumber, msgId) {
   return getSessionStore(sessionNumber).get(msgId) || null;
 }
 
-// Nettoyage automatique toutes les 20 min
-setInterval(() => {
+// Nettoyage par TTL : l'ancien code vidait tout toutes les 20 minutes, ce qui
+// rendait impossible la récupération d'un message supprimé plus tard.
+const antideleteCleaner = setInterval(() => {
+  const expiresBefore = Date.now() - STORE_RETENTION_MS;
   for (const [sessionNumber, store] of messageStores.entries()) {
-    store.clear();
-    console.log(`[ANTIDELETE] Store nettoyé pour session ${sessionNumber}`);
+    const times = messageStoreTimes.get(sessionNumber) || new Map();
+    let removed = 0;
+    for (const [msgId, storedAt] of times.entries()) {
+      if (storedAt > expiresBefore) continue;
+      store.delete(msgId);
+      times.delete(msgId);
+      removed += 1;
+    }
+    if (removed) console.log(`[ANTIDELETE] ${removed} ancien(s) message(s) nettoyé(s) pour ${sessionNumber}`);
   }
 }, STORE_CLEAN_INTERVAL);
+antideleteCleaner.unref?.();
 
 // ---------------- helpers kept/adapted ----------------
 
@@ -1024,129 +1067,131 @@ async function robustDownload(messageObj, downloader) {
 }
 async function handleMessageRevocation(socket, number) {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
-  const ownerJid  = `${sanitized}@s.whatsapp.net`;
+  const ownerJid = `${sanitized}@s.whatsapp.net`;
+  const pendingDeletes = new Map();
+  const inFlight = new Set();
+  const processed = new Map();
 
-  // ── Baileys émet parfois messages.delete ──
-  socket.ev.on('messages.delete', async ({ keys }) => {
-    if (!keys?.length) return;
-    for (const key of keys) {
-      try {
-        await processRevoke(sanitized, ownerJid, socket, key.id, key.remoteJid, key.participant);
-      } catch(e) { console.error('[AD messages.delete]', e); }
+  const eventId = key => `${key?.remoteJid || ''}:${key?.id || ''}`;
+  const alreadyProcessed = id => {
+    const timestamp = processed.get(id);
+    if (!timestamp) return false;
+    if (Date.now() - timestamp > 5 * 60 * 1000) {
+      processed.delete(id);
+      return false;
+    }
+    return true;
+  };
+  const markProcessed = id => {
+    processed.set(id, Date.now());
+    while (processed.size > 1000) processed.delete(processed.keys().next().value);
+  };
+
+  const run = async (revokedKey, revokeMessage = null) => {
+    if (!revokedKey?.id) return;
+    const id = eventId(revokedKey);
+    if (alreadyProcessed(id) || inFlight.has(id)) return;
+    inFlight.add(id);
+    try {
+      const result = await processRevoke({
+        sanitized,
+        ownerJid,
+        socket,
+        revokedKey,
+        revokeMessage
+      });
+      if (result !== 'not_found' && result !== 'error') markProcessed(id);
+    } finally {
+      inFlight.delete(id);
+    }
+  };
+
+  // messages.delete ne fournit généralement pas l'identité de la personne qui
+  // a supprimé. On attend brièvement le protocolMessage REVOKE, plus complet.
+  socket.ev.on('messages.delete', ({ keys }) => {
+    for (const key of keys || []) {
+      if (!key?.id) continue;
+      const id = eventId(key);
+      if (pendingDeletes.has(id) || alreadyProcessed(id)) continue;
+      const timer = setTimeout(() => {
+        pendingDeletes.delete(id);
+        run(key).catch(error => console.error('[AD messages.delete]', error));
+      }, 1000);
+      timer.unref?.();
+      pendingDeletes.set(id, timer);
     }
   });
 
-  // ── Mais surtout il émet messages.upsert avec protocolMessage REVOKE ──
+  // Le message protocolaire permet de distinguer la clé du message original
+  // (protocolMessage.key) de la personne ayant réellement révoqué (m.key).
   socket.ev.on('messages.upsert', async ({ messages }) => {
-    for (const m of messages) {
+    for (const revokeMessage of messages || []) {
       try {
-        if (m?.message?.protocolMessage?.type !== 0) continue; // type 0 = REVOKE
-        const revokedKey = m.message.protocolMessage.key;
-        if (!revokedKey?.id) continue;
-        await processRevoke(
-          sanitized, ownerJid, socket,
-          revokedKey.id,
-          revokedKey.remoteJid || m.key.remoteJid,
-          revokedKey.participant || m.key.participant
-        );
-      } catch(e) { console.error('[AD messages.upsert REVOKE]', e); }
+        const protocol = unwrapAntideleteMessage(revokeMessage?.message).message?.protocolMessage;
+        if (protocol?.type !== 0 || !protocol.key?.id) continue;
+        const revokedKey = {
+          ...protocol.key,
+          remoteJid: protocol.key.remoteJid || revokeMessage.key?.remoteJid
+        };
+        const id = eventId(revokedKey);
+        const pending = pendingDeletes.get(id);
+        if (pending) {
+          clearTimeout(pending);
+          pendingDeletes.delete(id);
+        }
+        await run(revokedKey, revokeMessage);
+      } catch (error) {
+        console.error('[AD messages.upsert REVOKE]', error);
+      }
     }
   });
 }
 
-// ── Fonction centrale de traitement ──
-// ── Fonction centrale de traitement Antidelete Corrigée ──
-async function processRevoke(sanitized, ownerJid, socket, msgId, chatId, participant) {
+async function processRevoke({ sanitized, ownerJid, socket, revokedKey, revokeMessage }) {
+  const msgId = revokedKey?.id;
+  const chatId = revokedKey?.remoteJid || revokeMessage?.key?.remoteJid;
+  if (!msgId || !chatId) return 'invalid';
+
   try {
     const cfg = await loadUserConfigFromMongo(sanitized) || {};
+    if (!modeAllowsChat(cfg.antidelete, chatId)) return 'ignored';
 
-    // 1. Vérification si l'antidelete est activé
-    if (!cfg.antidelete || cfg.antidelete === 'off') return;
-
-    const mode = cfg.antidelete; // 'all' | 'g' | 'p' | true
-    const isGroup   = (chatId || '').endsWith('@g.us');
-    const isPrivate = (chatId || '').endsWith('@s.whatsapp.net');
-
-    // Filtres selon la configuration
-    if (mode === 'g' && !isGroup) return; 
-    if (mode === 'p' && !isPrivate) return; 
-
-    // 2. Récupération du message original depuis la mémoire
     const deletedMsg = getStoredMessage(sanitized, msgId);
     if (!deletedMsg) {
       console.warn(`[ANTIDELETE] ${msgId} non trouvé dans le store (session ${sanitized})`);
-      return;
+      return 'not_found';
     }
 
-    // Infos de l'expéditeur et contexte
-    const senderNum    = (participant || chatId || '').split('@')[0];
-    const deletionTime = getHaitiTimestamp();
-    const contextInfo  = isGroup ? `👥 *Groupe :* ${chatId}\n` : `💬 *Privé :* ${senderNum}\n`;
-
-    // 3. Déballage récursif (Vue Unique, Éphémère, etc.)
-    let m = deletedMsg.message;
-    let isViewOnce = false;
-
-    while (m && (m.ephemeralMessage || m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension || m.documentWithCaptionMessage)) {
-      if (m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension) {
-        isViewOnce = true;
-      }
-      m = m.ephemeralMessage?.message 
-       || m.viewOnceMessage?.message 
-       || m.viewOnceMessageV2?.message 
-       || m.viewOnceMessageV2Extension?.message 
-       || m.documentWithCaptionMessage?.message;
-    }
-
-    if (!m) {
-      console.warn(`[ANTIDELETE] Impossible de déballer la structure du message ${msgId}`);
-      return;
-    }
-
-    // ASTUCE VUE UNIQUE : On désactive le drapeau viewOnce pour que copyNForward l'envoie normalement
-    if (m.imageMessage) m.imageMessage.viewOnce = false;
-    if (m.videoMessage) m.videoMessage.viewOnce = false;
-
-    // On remplace le message d'origine par le message déballé et nettoyé
-    deletedMsg.message = m;
-
-    // En-tête d'avertissement envoyé en privé au propriétaire (ownerJid)
-    let header = `╭━━━━━━━━━━━━━━━━━━╮\n` +
-                 `┃  🗑️ *ANTIDELETE*\n` +
-                 `╰━━━━━━━━━━━━━━━━━━╯\n\n` +
-                 `👤 *Auteur :* @${senderNum}\n` +
-                 `${contextInfo}` +
-                 `⏰ *Heure  :* ${deletionTime}\n` +
-                 `${isViewOnce ? '👁️ *Type d\'origine :* Vue Unique (Convertie)\n' : ''}` +
-                 `━━━━━━━━━━━━━━━━━━\n` +
-                 `👇 *Message retransmis ci-dessous :*`;
-
-    // Envoi de l'alerte d'en-tête en privé
-    await socket.sendMessage(ownerJid, {
-      text: header,
-      mentions: [participant || chatId]
+    const authorJid = resolveOriginalAuthor(deletedMsg, chatId, ownerJid);
+    const revokerJid = resolveRevoker(revokeMessage, chatId, ownerJid, authorJid);
+    const conversationName = await resolveConversationName(socket, chatId, deletedMsg, revokeMessage);
+    const { isViewOnce } = unwrapAntideleteMessage(deletedMsg.message);
+    const mentions = uniqueMentions(revokerJid, authorJid);
+    const header = buildAntideleteHeader({
+      revokerJid,
+      authorJid,
+      conversationName,
+      timestamp: getHaitiTimestamp(),
+      isViewOnce
     });
 
-    // 4. Retransmission directe avec copyNForward vers votre privé (ownerJid)
-    if (typeof socket.copyNForward === 'function') {
-      await socket.copyNForward(ownerJid, deletedMsg, true);
-    } else {
-      // Option de secours si la fonction porte un autre nom dans votre structure
-      await socket.sendMessage(ownerJid, { forward: deletedMsg });
-    }
+    await sendRecoveredMessage({
+      socket,
+      ownerJid,
+      storedMessage: deletedMsg,
+      header,
+      mentions,
+      downloadContent: downloadContentFromMessage
+    });
 
-    // 5. Nettoyage de la mémoire du store pour ce message
-    const sessionStore = getSessionStore(sanitized);
-    if (sessionStore && sessionStore.has(msgId)) {
-      sessionStore.delete(msgId);
-    }
-
-  } catch (globalError) {
-    console.error('[ANTIDELETE FATAL ERROR] :', globalError);
+    deleteStoredMessage(sanitized, msgId);
+    return 'recovered';
+  } catch (error) {
+    // Conserver l'entrée pour permettre une nouvelle tentative si le réseau ou
+    // le téléchargement du média a échoué temporairement.
+    console.error('[ANTIDELETE FATAL ERROR]', error);
+    return 'error';
   }
-
-  // Supprimer du store après traitement
-  getSessionStore(sanitized).delete(msgId);
 }
 
 function generateTS() { return Math.floor(Date.now() / 1000); }
@@ -1321,9 +1366,11 @@ function handleGroupStatusMention(socket, sessionId) {
 function setupCommandHandlers(socket, number) {
   socket.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
-    // ── STORE tous les messages pour antidelete ──
+    // ── STORE des messages privés/groupes pour antidelete ──
   for (const m of messages) {
-    if (m?.key?.id && m?.message && !m.key.fromMe) {
+    if (m?.key?.id && m?.message && modeAllowsChat('all', m.key.remoteJid)) {
+      // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe est
+      // indispensable pour identifier correctement l'auteur et le suppresseur.
       storeMessage(number, m);
     }
   }
@@ -5712,7 +5759,7 @@ case 'ad': {
 
     // ── Sous-commandes ──
     if (sub === 'status') {
-      const mode      = cfg.antidelete || 'off';
+      const mode = normaliseAntideleteMode(cfg.antidelete);
       const storeSize = getSessionStore(sanitized).size;
       const modeLabel = mode === 'all' ? '🌐 Tout (groupes + privé)'
                       : mode === 'g'   ? '👥 Groupes seulement'
@@ -5732,7 +5779,7 @@ case 'ad': {
 
     if (sub === 'off') {
       cfg.antidelete = 'off';
-      getSessionStore(sanitized).clear();
+      clearSessionStore(sanitized);
     } else if (sub === 'g') {
       cfg.antidelete = 'g';   // groupes seulement
     } else if (sub === 'p') {

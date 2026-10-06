@@ -16,7 +16,7 @@
   - Statut en temps réel et métriques système (`/dashboard/active.html`).
 - **🛡️ Sécurité & Modération de Groupe :**
   - **Anti-Link :** Suppression automatique des liens externes indésirables.
-  - **Anti-Delete :** Retransmission privée des messages et médias éphémères supprimés.
+  - **Anti-Delete :** modes privé/groupe/tout, prise en charge des chats LID, récupération directe des médias et identification du véritable suppresseur avec le nom de la conversation.
   - **Anti-Status Mention :** Avertissement et expulsion en cas de spam de mentions.
   - **Bienvenue / Au revoir :** Messages personnalisés pour les nouveaux membres.
 - **📥 Téléchargeurs Multimédia :**
@@ -31,7 +31,7 @@
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
-  - Téléversement de fichiers vers lien direct (`.tourl`).
+  - Téléversement de fichiers vers lien direct avec fallback automatique Uguu/Catbox/0x0.st/TmpFiles (`.tourl`).
   - Générateur de polices stylisées (`.fancy`).
   - Jeux interactifs : Morpion rétro (`.ttt`, `.delttt`).
 
@@ -100,6 +100,13 @@ COBALT_API_KEY=
 # Facultatif : photos Pexels prioritaires pour `.img`.
 # Sans clé, `.img` utilise automatiquement Openverse.
 PEXELS_API_KEY=
+
+# Facultatif : durée/quota antidelete et limites de .tourl
+ANTIDELETE_STORE_MAX=1500
+ANTIDELETE_RETENTION_MS=86400000
+TOURL_MAX_BYTES=104857600
+TOURL_TIMEOUT_MS=60000
+CATBOX_USER_HASH=
 ```
 
 > La page publique `t.me/addstickers/...` ne contient plus les fichiers `.tgs`. La commande `.tgs` utilise donc l’API officielle Telegram (`getStickerSet` puis `getFile`), ce qui nécessite `TELEGRAM_BOT_TOKEN`. Le token reste côté serveur et n’est jamais envoyé dans les messages ou les logs d’erreur.
@@ -116,6 +123,15 @@ Le serveur démarrera sur `http://localhost:3000` :
 Le dashboard demande uniquement `ADMIN_PASS` — aucun nom d’utilisateur. Les pages et les API de gestion sont protégées par un cookie signé, `HttpOnly` et `SameSite=Strict`. Si `ADMIN_PASS` est absent, l’accès administratif est refusé plutôt que d’utiliser un mot de passe par défaut.
 
 Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`; le bot reconnaît aussi les anciens formats MongoDB et les identités WhatsApp LID lorsque le numéro alternatif est disponible. Une chaîne ajoutée depuis le dashboard est enregistrée avec les mêmes emojis que `.cfn`, puis suivie immédiatement par toutes les sessions actives.
+
+### AntiDelete
+
+- `.ad p` surveille uniquement les discussions privées, y compris celles identifiées par un JID `@lid`.
+- `.ad g` surveille uniquement les groupes; `.ad all` active les deux modes et `.ad off` désactive la fonction.
+- L’alerte indique la personne qui a réellement envoyé la révocation, l’auteur original s’il est différent, puis le nom du contact ou du groupe.
+- Images, vidéos, audios, documents, stickers et médias à vue unique sont téléchargés puis renvoyés directement. Le store conserve les métadonnées 24 heures par défaut au lieu d’être vidé toutes les 20 minutes.
+
+`.tourl` essaie les hébergeurs l’un après l’autre. Une erreur Catbox telle que HTTP 412 déclenche automatiquement le fournisseur suivant plutôt que d’interrompre la commande.
 
 ---
 
