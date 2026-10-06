@@ -9,6 +9,7 @@
 - **⚡ Multi-Sessions & Multi-Device :** Connexion de plusieurs numéros WhatsApp simultanément via code de pairing sans scan QR.
 - **🔄 Reconnexion Automatique :** Gestion intelligente des déconnexions réseau temporaires sans perte de session.
 - **🔥 Hot-Reload Automatique :** Dès que vous ajoutez, modifiez ou supprimez un fichier dans `plugins/`, il est rechargé instantanément en mémoire sans redémarrer le bot ni taper de commande !
+- **⛩ Thème Onigashima :** Le menu est construit depuis les commandes et alias réellement chargés; les réponses textuelles de toutes les commandes utilisent automatiquement la même identité visuelle, y compris les commandes historiques.
 - **🌐 Tableau de Bord Web Complet :**
   - Gestion des sessions actives et archivées (`/dashboard/sessions.html`).
   - Gestion des newsletters WhatsApp et auto-réactions (`/dashboard/newsletters.html`).

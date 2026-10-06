@@ -50,6 +50,11 @@ const {
   buildAntideleteHeader,
   sendRecoveredMessage
 } = require('./services/antidelete');
+const {
+  withCommandTheme,
+  activateCommandTheme,
+  setupCommandThemeWrapper
+} = require('./services/oni-theme');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('./files/sticker_cmd');
 const { findReactionCommand, initReactionDb } = require('./files/reaction_cmd');
@@ -1364,7 +1369,7 @@ function handleGroupStatusMention(socket, sessionId) {
 }
 // ---------------- command handlers ----------------
 function setupCommandHandlers(socket, number) {
-  socket.ev.on('messages.upsert', async ({ messages }) => {
+  socket.ev.on('messages.upsert', ({ messages }) => withCommandTheme(async () => {
     const msg = messages[0];
     // ── STORE des messages privés/groupes pour antidelete ──
   for (const m of messages) {
@@ -1425,6 +1430,7 @@ function setupCommandHandlers(socket, number) {
         const fullBody = `${cmdPrefix}${fullCmdStr}`;
         const cmdName = fullCmdStr.split(' ')[0].toLowerCase();
         const cmdArgs = fullCmdStr.split(' ').slice(1);
+        activateCommandTheme(cmdName);
 
         const quotedPayload = targetMsg?.message || null;
         const quotedParticipant = targetMsg?.key?.participant || targetKey?.participant || targetKey?.remoteJid;
@@ -1461,7 +1467,9 @@ function setupCommandHandlers(socket, number) {
           from: targetChat,
           sender: reactorJid,
           senderNumber: reactorNumber,
+          pushName: msg.pushName || '',
           sessionNumber: String(number || sanitizedBot).replace(/[^0-9]/g, ''),
+          legacyCommands: [...LEGACY_COMMANDS],
           args: cmdArgs,
           body: fullBody,
           isOwner: isReactorOwner,
@@ -1665,6 +1673,9 @@ function setupCommandHandlers(socket, number) {
       return;
     }
     const { command, args } = parsedCommand;
+    // Toutes les réponses textuelles produites dans ce contexte adoptent le
+    // thème Onigashima. AsyncLocalStorage isole les commandes concurrentes.
+    activateCommandTheme(command);
 
     // 5. Récupérer les informations d'expéditeur
     const from = remoteJid;
@@ -1753,7 +1764,9 @@ function setupCommandHandlers(socket, number) {
         from,
         sender: nowsender,
         senderNumber,
+        pushName: msg.pushName || '',
         sessionNumber: sanitizedBot,
+        legacyCommands: [...LEGACY_COMMANDS],
         args,
         body,
         isOwner,
@@ -10554,7 +10567,7 @@ case 'resetconfig': {
       try { await socket.sendMessage(sender, { image: { url: config.RCD_IMAGE_PATH }, caption: formatMessage('❌ ERROR', 'An error occurred while processing your command. Please try again.', BOT_NAME_FANCY) }); } catch(e){}
     }
 
-  });
+  }));
 }
 
 // ---------------- message handlers ----------------
@@ -10665,6 +10678,7 @@ async function EmpirePair(number, res) {
 socketCreationTime.set(sanitizedNumber, Date.now());
 socket.downloadMediaMessage = (m, filename) => downloadMediaMessage(m, filename)
 await setupTranslationWrapper(socket, sanitizedNumber);
+setupCommandThemeWrapper(socket);
 // ============================================================
 setupStatusHandlers(socket, sanitizedNumber);
 setupCommandHandlers(socket, sanitizedNumber);
