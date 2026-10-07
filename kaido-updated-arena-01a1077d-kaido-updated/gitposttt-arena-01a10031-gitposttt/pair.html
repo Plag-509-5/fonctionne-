@@ -232,7 +232,7 @@ submitBtn.addEventListener("click", async (e) => {
   try {
     const { data } = await axios(`/code?number=${cleanNumber}`);
     const code = data.code || data.pairingCode || "Indisponible";
-    
+
     pairElement.innerHTML = `
       <div class="code-display" id="codeDisplay" data-code="${code}" onclick="copyCode()">
         CODE : <span style="color:#ffffff">${code}</span>

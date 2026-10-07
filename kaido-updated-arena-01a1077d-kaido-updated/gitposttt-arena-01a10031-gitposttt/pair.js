@@ -13,7 +13,49 @@ const axios = require('axios');
 const FileType = require('file-type');
 const fetch = require('node-fetch');
 const { MongoClient } = require('mongodb');
-const { loadPlugins, executePlugin, getPluginsByCategory, getAllPluginsList } = require('./pluginLoader');
+const { loadPlugins, executePlugin, getPlugins, getPluginsByCategory, getAllPluginsList } = require('./pluginLoader');
+const {
+  resolveSessionPrefix,
+  parseCommandInput,
+  extractMainCommandNames
+} = require('./services/command-routing');
+const {
+  configEnabled,
+  handleIgnoredMessage,
+  wakeForCommand,
+  applyAlwaysOnlineSetting
+} = require('./services/presence-mode');
+const {
+  canonicalAdmin,
+  collectMessageIdentifiers,
+  addIdentifierCandidates,
+  ownerNumbers,
+  resolveAccess
+} = require('./services/access-control');
+const {
+  DEFAULT_NEWSLETTER_EMOJIS,
+  normaliseNewsletterJid,
+  normaliseEmojiList,
+  resolveNewsletterEmojis,
+  syncNewsletterSockets
+} = require('./services/newsletter-config');
+const {
+  modeAllowsChat,
+  normaliseAntideleteMode,
+  unwrapMessage: unwrapAntideleteMessage,
+  resolveOriginalAuthor,
+  resolveRevoker,
+  resolveConversationName,
+  uniqueMentions,
+  buildAntideleteHeader,
+  sendRecoveredMessage
+} = require('./services/antidelete');
+const {
+  withCommandTheme,
+  activateCommandTheme,
+  isOniThemeEnabled,
+  setupCommandThemeWrapper
+} = require('./services/oni-theme');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('./files/sticker_cmd');
 const { findReactionCommand, initReactionDb } = require('./files/reaction_cmd');
@@ -25,8 +67,10 @@ const { ytmp3, ytmp4 } = require('./youtube');
 const { getGroupAdminsInfo, jidToNumber } = require('./normalize');
 const { uploadFile: uploadCloudku } = require("cloudku-uploader");
 const FormData = require("form-data");
-// dans ton switch principal
-const { groupStatus, buildStatusContent } = require('./status');
+const {
+  resolveGroupSelection,
+  actorIdFromMessage
+} = require('./services/group-status-selector');
 const { handleAntiLink } = require('./antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('./antilink');
 const cheerio = require('cheerio');
@@ -80,8 +124,39 @@ const DEFAULT_SESSION_CONFIG = {
   PREFIX: '.',
   AUTO_ONLINE: false,
   ANTI_TAG_MODE: true,
-  MODE: 'public'
+  MODE: 'public',
+  THEME: 'onigashima',
+  SUDO_USERS: []
 };
+
+// En mode prefixless, seuls les noms réellement connus doivent réveiller le bot.
+// Le switch principal contient un sous-switch pour `.config`; ses options ne sont
+// donc pas des commandes autonomes et sont retirées du registre historique.
+const CONFIG_ONLY_SUBCOMMANDS = new Set([
+  'alwaysonline', 'autoonline', 'online',
+  'autoview', 'autolike', 'autorec', 'setemoji', 'setlikeemoji',
+  'setprefix', 'show', 'get'
+]);
+const LEGACY_COMMANDS = (() => {
+  try {
+    const source = fs.readFileSync(__filename, 'utf8');
+    return extractMainCommandNames(source, CONFIG_ONLY_SUBCOMMANDS);
+  } catch (error) {
+    console.warn('[COMMAND REGISTRY] Impossible de lire les commandes historiques:', error.message);
+    return new Set();
+  }
+})();
+
+function isKnownCommandName(command) {
+  const name = String(command || '').toLowerCase();
+  return getPlugins().has(name) || LEGACY_COMMANDS.has(name);
+}
+
+const SESSION_CONFIG_CACHE_TTL_MS = 5_000;
+const sessionConfigCache = new Map();
+const ADMIN_CACHE_TTL_MS = 5_000;
+let adminCache = { value: [], expiresAt: 0 };
+
 const config = {
   MAX_RETRIES: 3,
   GROUP_INVITE_LINK: 'https://chat.whatsapp.com/DLK3kh1Ze2qHUfNKCZ3iXN?mode=gi_t',
@@ -99,6 +174,9 @@ const config = {
   BUTTON_IMAGES: { ALIVE: 'https://files.catbox.moe/l1lzbx.png' }
 };
 
+function primaryOwnerNumber() {
+  return ownerNumbers(config.OWNER_NUMBER)[0] || '';
+}
 
 // ---------------- MONGO SETUP ----------------
 
@@ -188,12 +266,26 @@ async function getAllNumbersFromMongo() {
   } catch (e) { console.error('getAllNumbersFromMongo', e); return []; }
 }
 
-async function loadAdminsFromMongo() {
+async function loadAdminsFromMongo(forceRefresh = false) {
   try {
+    if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
     await initMongo();
     const docs = await adminsCol.find({}).toArray();
-    return docs.map(d => d.jid || d.number).filter(Boolean);
-  } catch (e) { console.error('loadAdminsFromMongo', e); return []; }
+    const admins = [];
+    const seen = new Set();
+    for (const doc of docs) {
+      const identity = canonicalAdmin(doc);
+      const value = identity.jid || identity.raw;
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      admins.push(value);
+    }
+    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS };
+    return [...admins];
+  } catch (e) {
+    console.error('loadAdminsFromMongo', e);
+    return adminCache.value.length ? [...adminCache.value] : [];
+  }
 }
 
 // Récupérer le statut d'un groupe (welcome ou goodbye)
@@ -227,34 +319,79 @@ async function setGroupFeatureStatus(groupId, feature, status) {
 async function addAdminToMongo(jidOrNumber) {
   try {
     await initMongo();
-    const doc = { jid: jidOrNumber };
-    await adminsCol.updateOne({ jid: jidOrNumber }, { $set: doc }, { upsert: true });
-    console.log(`Added admin ${jidOrNumber}`);
-  } catch (e) { console.error('addAdminToMongo', e); }
+    const identity = canonicalAdmin(jidOrNumber);
+    if (!identity.number) throw new Error('Numéro ou JID administrateur invalide');
+    const jid = identity.jid || identity.raw;
+    const filters = [{ jid }, { jid: identity.raw }];
+    if (identity.number) filters.push({ number: identity.number });
+    await adminsCol.updateOne(
+      { $or: filters },
+      { $set: { jid, number: identity.number || null, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    adminCache = { value: [], expiresAt: 0 };
+    console.log(`Added admin ${jid}`);
+    return jid;
+  } catch (e) {
+    console.error('addAdminToMongo', e);
+    throw e;
+  }
 }
 
 async function removeAdminFromMongo(jidOrNumber) {
   try {
     await initMongo();
-    await adminsCol.deleteOne({ jid: jidOrNumber });
-    console.log(`Removed admin ${jidOrNumber}`);
-  } catch (e) { console.error('removeAdminFromMongo', e); }
+    const identity = canonicalAdmin(jidOrNumber);
+    const docs = await adminsCol.find({}).toArray();
+    const matchingIds = docs
+      .filter(doc => {
+        const existing = canonicalAdmin(doc);
+        return (identity.number && existing.number === identity.number) ||
+          (identity.raw && existing.raw === identity.raw) ||
+          (identity.jid && existing.jid === identity.jid);
+      })
+      .map(doc => doc._id)
+      .filter(Boolean);
+    if (matchingIds.length) await adminsCol.deleteMany({ _id: { $in: matchingIds } });
+    adminCache = { value: [], expiresAt: 0 };
+    console.log(`Removed admin ${identity.jid || identity.raw}`);
+    return true;
+  } catch (e) {
+    console.error('removeAdminFromMongo', e);
+    throw e;
+  }
 }
 
 async function addNewsletterToMongo(jid, emojis = []) {
   try {
     await initMongo();
-    const doc = { jid, emojis: Array.isArray(emojis) ? emojis : [], addedAt: new Date() };
-    await newsletterCol.updateOne({ jid }, { $set: doc }, { upsert: true });
-    console.log(`Added newsletter ${jid} -> emojis: ${doc.emojis.join(',')}`);
+    const normalizedJid = normaliseNewsletterJid(jid);
+    if (!normalizedJid) throw new Error('JID de chaîne invalide');
+    const normalizedEmojis = normaliseEmojiList(emojis);
+    const doc = { jid: normalizedJid, emojis: normalizedEmojis, updatedAt: new Date() };
+
+    // Les deux collections historiques restent synchronisées afin que le
+    // dashboard et `.cfn` alimentent exactement le même moteur de réactions.
+    await Promise.all([
+      newsletterCol.updateOne({ jid: normalizedJid }, { $set: doc, $setOnInsert: { addedAt: new Date() } }, { upsert: true }),
+      newsletterReactsCol.updateOne({ jid: normalizedJid }, { $set: doc, $setOnInsert: { addedAt: new Date() } }, { upsert: true })
+    ]);
+    console.log(`Added newsletter ${normalizedJid} -> emojis: ${normalizedEmojis.join(',')}`);
+    return { jid: normalizedJid, emojis: normalizedEmojis };
   } catch (e) { console.error('addNewsletterToMongo', e); throw e; }
 }
 
 async function removeNewsletterFromMongo(jid) {
   try {
     await initMongo();
-    await newsletterCol.deleteOne({ jid });
-    console.log(`Removed newsletter ${jid}`);
+    const normalizedJid = normaliseNewsletterJid(jid);
+    if (!normalizedJid) throw new Error('JID de chaîne invalide');
+    await Promise.all([
+      newsletterCol.deleteOne({ jid: normalizedJid }),
+      newsletterReactsCol.deleteOne({ jid: normalizedJid })
+    ]);
+    console.log(`Removed newsletter ${normalizedJid}`);
+    return normalizedJid;
   } catch (e) { console.error('removeNewsletterFromMongo', e); throw e; }
 }
 
@@ -262,7 +399,12 @@ async function listNewslettersFromMongo() {
   try {
     await initMongo();
     const docs = await newsletterCol.find({}).toArray();
-    return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
+    return docs
+      .map(doc => ({
+        jid: normaliseNewsletterJid(doc.jid),
+        emojis: normaliseEmojiList(doc.emojis)
+      }))
+      .filter(doc => doc.jid);
   } catch (e) { console.error('listNewslettersFromMongo', e); return []; }
 }
 
@@ -280,9 +422,22 @@ async function saveNewsletterReaction(jid, messageId, emoji, sessionNumber) {
 async function setUserConfigInMongo(number, conf) {
   try {
     await initMongo();
-    const sanitized = number.replace(/[^0-9]/g, '');
-    await configsCol.updateOne({ number: sanitized }, { $set: { number: sanitized, config: conf, updatedAt: new Date() } }, { upsert: true });
-  } catch (e) { console.error('setUserConfigInMongo', e); }
+    const sanitized = String(number || '').replace(/[^0-9]/g, '');
+    if (!sanitized) throw new Error('Numéro de session invalide');
+    await configsCol.updateOne(
+      { number: sanitized },
+      { $set: { number: sanitized, config: conf, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    sessionConfigCache.set(sanitized, {
+      value: { ...DEFAULT_SESSION_CONFIG, ...(conf || {}) },
+      expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
+    });
+    return true;
+  } catch (e) {
+    console.error('setUserConfigInMongo', e);
+    return false;
+  }
 }
 
 async function loadUserConfigFromMongo(number) {
@@ -294,13 +449,20 @@ async function loadUserConfigFromMongo(number) {
   } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
 }
 
-async function loadSessionConfigMerged(number) {
-  const sanitized = String(number).replace(/[^0-9]/g, '');
-  // charge la config brute depuis la DB
+async function loadSessionConfigMerged(number, forceRefresh = false) {
+  const sanitized = String(number || '').replace(/[^0-9]/g, '');
+  if (!sanitized) return { ...DEFAULT_SESSION_CONFIG };
+
+  const cached = sessionConfigCache.get(sanitized);
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) return { ...cached.value };
+
   const dbCfg = await loadUserConfigFromMongo(sanitized) || {};
-  // fusionne : les valeurs en DB écrasent les defaults
   const merged = { ...DEFAULT_SESSION_CONFIG, ...dbCfg };
-  return merged;
+  sessionConfigCache.set(sanitized, {
+    value: merged,
+    expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
+  });
+  return { ...merged };
 }
 
 // Helpers Mongo pour persister le schedule
@@ -460,34 +622,31 @@ async function setStatusInfractionCount(sessionId, groupId, participant, count) 
 // -------------- newsletter react-config helpers --------------
 
 async function addNewsletterReactConfig(jid, emojis = []) {
-  try {
-    await initMongo();
-    await newsletterReactsCol.updateOne({ jid }, { $set: { jid, emojis, addedAt: new Date() } }, { upsert: true });
-    console.log(`Added react-config for ${jid} -> ${emojis.join(',')}`);
-  } catch (e) { console.error('addNewsletterReactConfig', e); throw e; }
+  return addNewsletterToMongo(jid, emojis);
 }
 
 async function removeNewsletterReactConfig(jid) {
-  try {
-    await initMongo();
-    await newsletterReactsCol.deleteOne({ jid });
-    console.log(`Removed react-config for ${jid}`);
-  } catch (e) { console.error('removeNewsletterReactConfig', e); throw e; }
+  return removeNewsletterFromMongo(jid);
 }
 
 async function listNewsletterReactsFromMongo() {
   try {
     await initMongo();
     const docs = await newsletterReactsCol.find({}).toArray();
-    return docs.map(d => ({ jid: d.jid, emojis: Array.isArray(d.emojis) ? d.emojis : [] }));
+    return docs
+      .map(doc => ({ jid: normaliseNewsletterJid(doc.jid), emojis: normaliseEmojiList(doc.emojis) }))
+      .filter(doc => doc.jid);
   } catch (e) { console.error('listNewsletterReactsFromMongo', e); return []; }
 }
 
 async function getReactConfigForJid(jid) {
   try {
     await initMongo();
-    const doc = await newsletterReactsCol.findOne({ jid });
-    return doc ? (Array.isArray(doc.emojis) ? doc.emojis : []) : null;
+    const normalizedJid = normaliseNewsletterJid(jid);
+    if (!normalizedJid) return null;
+    const doc = await newsletterCol.findOne({ jid: normalizedJid }) ||
+      await newsletterReactsCol.findOne({ jid: normalizedJid });
+    return doc ? normaliseEmojiList(doc.emojis) : null;
   } catch (e) { console.error('getReactConfigForJid', e); return null; }
 }
 
@@ -521,41 +680,73 @@ const otpStore = new Map();
 // ANTIDELETE STORE — Store en mémoire par session
 // ============================================================
 const messageStores = new Map(); // sessionNumber → Map<msgId, msgObject>
+const messageStoreTimes = new Map(); // sessionNumber → Map<msgId, storedAt>
 
-const STORE_MAX_PER_SESSION = 500;  // quota max par session
-const STORE_CLEAN_INTERVAL  = 20 * 60 * 1000; // nettoyage toutes les 20 min
+const STORE_MAX_PER_SESSION = Math.max(500, Number(process.env.ANTIDELETE_STORE_MAX) || 1500);
+const STORE_RETENTION_MS = Math.max(20 * 60 * 1000, Number(process.env.ANTIDELETE_RETENTION_MS) || 24 * 60 * 60 * 1000);
+const STORE_CLEAN_INTERVAL = 20 * 60 * 1000;
 
 function getSessionStore(sessionNumber) {
-  if (!messageStores.has(sessionNumber)) {
-    messageStores.set(sessionNumber, new Map());
-  }
+  if (!messageStores.has(sessionNumber)) messageStores.set(sessionNumber, new Map());
+  if (!messageStoreTimes.has(sessionNumber)) messageStoreTimes.set(sessionNumber, new Map());
   return messageStores.get(sessionNumber);
+}
+
+function deleteStoredMessage(sessionNumber, msgId) {
+  getSessionStore(sessionNumber).delete(msgId);
+  messageStoreTimes.get(sessionNumber)?.delete(msgId);
+}
+
+function clearSessionStore(sessionNumber) {
+  getSessionStore(sessionNumber).clear();
+  messageStoreTimes.get(sessionNumber)?.clear();
 }
 
 function storeMessage(sessionNumber, msg) {
   if (!msg?.key?.id || !msg?.message) return;
-  const store = getSessionStore(sessionNumber);
+  // Un protocole REVOKE décrit une suppression : ce n'est pas le message
+  // original et il ne doit jamais remplacer une entrée du store.
+  if (unwrapAntideleteMessage(msg.message).message?.protocolMessage?.type === 0) return;
 
-  // Quota dépassé → vider les 100 plus anciens
-  if (store.size >= STORE_MAX_PER_SESSION) {
-    const keys = [...store.keys()].slice(0, 100);
-    keys.forEach(k => store.delete(k));
+  const store = getSessionStore(sessionNumber);
+  const times = messageStoreTimes.get(sessionNumber);
+
+  // Quota dépassé → supprimer les entrées les plus anciennes sans vider les
+  // conversations récentes. Les objets Baileys ne contiennent pas les buffers.
+  while (store.size >= STORE_MAX_PER_SESSION) {
+    const oldestKey = store.keys().next().value;
+    if (!oldestKey) break;
+    store.delete(oldestKey);
+    times.delete(oldestKey);
   }
 
+  // Réinsérer actualise aussi l'ordre LRU de la Map.
+  store.delete(msg.key.id);
   store.set(msg.key.id, msg);
+  times.set(msg.key.id, Date.now());
 }
 
 function getStoredMessage(sessionNumber, msgId) {
   return getSessionStore(sessionNumber).get(msgId) || null;
 }
 
-// Nettoyage automatique toutes les 20 min
-setInterval(() => {
+// Nettoyage par TTL : l'ancien code vidait tout toutes les 20 minutes, ce qui
+// rendait impossible la récupération d'un message supprimé plus tard.
+const antideleteCleaner = setInterval(() => {
+  const expiresBefore = Date.now() - STORE_RETENTION_MS;
   for (const [sessionNumber, store] of messageStores.entries()) {
-    store.clear();
-    console.log(`[ANTIDELETE] Store nettoyé pour session ${sessionNumber}`);
+    const times = messageStoreTimes.get(sessionNumber) || new Map();
+    let removed = 0;
+    for (const [msgId, storedAt] of times.entries()) {
+      if (storedAt > expiresBefore) continue;
+      store.delete(msgId);
+      times.delete(msgId);
+      removed += 1;
+    }
+    if (removed) console.log(`[ANTIDELETE] ${removed} ancien(s) message(s) nettoyé(s) pour ${sessionNumber}`);
   }
 }, STORE_CLEAN_INTERVAL);
+antideleteCleaner.unref?.();
 
 // ---------------- helpers kept/adapted ----------------
 
@@ -609,7 +800,7 @@ async function sendAdminConnectMessage(socket, number, groupResult, sessionConfi
 
 async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfig = {}) {
   try {
-    const ownerJid = `${config.OWNER_NUMBER.replace(/[^0-9]/g,'')}@s.whatsapp.net`;
+    const ownerJid = `${primaryOwnerNumber()}@s.whatsapp.net`;
     const activeCount = activeSockets.size;
     const botName = sessionConfig.botName || BOT_NAME_FANCY;
     const image = sessionConfig.logo || config.RCD_IMAGE_PATH;
@@ -683,23 +874,30 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
     const jid = message.key.remoteJid;
 
     try {
+      const normalizedJid = normaliseNewsletterJid(jid);
+      if (!normalizedJid) return;
       const followedDocs = await listNewslettersFromMongo(); // array of {jid, emojis}
-      const reactConfigs = await listNewsletterReactsFromMongo(); // [{jid, emojis}]
+      const reactConfigs = await listNewsletterReactsFromMongo(); // compatibilité ancienne collection
       const reactMap = new Map();
-      for (const r of reactConfigs) reactMap.set(r.jid, r.emojis || []);
-
-      const followedJids = followedDocs.map(d => d.jid);
-      if (!followedJids.includes(jid) && !reactMap.has(jid)) return;
-
-      let emojis = reactMap.get(jid) || null;
-      if ((!emojis || emojis.length === 0) && followedDocs.find(d => d.jid === jid)) {
-        emojis = (followedDocs.find(d => d.jid === jid).emojis || []);
+      for (const item of reactConfigs) {
+        const itemJid = normaliseNewsletterJid(item.jid);
+        if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
       }
-      if (!emojis || emojis.length === 0) emojis = config.AUTO_LIKE_EMOJI;
 
-      let idx = rrPointers.get(jid) || 0;
+      const followed = followedDocs.find(item => item.jid === normalizedJid);
+      if (!followed && !reactMap.has(normalizedJid)) return;
+
+      // newsletter_list est la source principale partagée par le dashboard et
+      // `.cfn`; l'ancienne collection ne sert que de compatibilité.
+      const emojis = resolveNewsletterEmojis(
+        followed?.emojis,
+        reactMap.get(normalizedJid),
+        DEFAULT_NEWSLETTER_EMOJIS
+      );
+
+      let idx = rrPointers.get(normalizedJid) || 0;
       const emoji = emojis[idx % emojis.length];
-      rrPointers.set(jid, (idx + 1) % emojis.length);
+      rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
 
       const messageId = message.newsletterServerId || message.key.id;
       if (!messageId) return;
@@ -708,12 +906,12 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
       while (retries-- > 0) {
         try {
           if (typeof socket.newsletterReactMessage === 'function') {
-            await socket.newsletterReactMessage(jid, messageId.toString(), emoji);
+            await socket.newsletterReactMessage(normalizedJid, messageId.toString(), emoji);
           } else {
-            await socket.sendMessage(jid, { react: { text: emoji, key: message.key } });
+            await socket.sendMessage(normalizedJid, { react: { text: emoji, key: message.key } });
           }
-          console.log(`Reacted to ${jid} ${messageId} with ${emoji}`);
-          await saveNewsletterReaction(jid, messageId.toString(), emoji, sessionNumber || null);
+          console.log(`Reacted to ${normalizedJid} ${messageId} with ${emoji}`);
+          await saveNewsletterReaction(normalizedJid, messageId.toString(), emoji, sessionNumber || null);
           break;
         } catch (err) {
           console.warn(`Reaction attempt failed (${3 - retries}/3):`, err?.message || err);
@@ -790,16 +988,12 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
     console.log('[HANDLER] merged cfg for', sessionId, cfg);
 
     try {
-      if (cfg.AUTO_ONLINE) {
+      if (configEnabled(cfg.AUTO_ONLINE, false)) {
         console.log('[HANDLER] AUTO_ONLINE -> sending available presence');
         await socket.sendPresenceUpdate('available', message.key.remoteJid);
-        setTimeout(async () => {
-          try { await socket.sendPresenceUpdate('unavailable', message.key.remoteJid); }
-          catch (e) { console.warn('[HANDLER] presence revert failed', e); }
-        }, 5000);
       }
 
-      if (cfg.AUTO_RECORDING) {
+      if (configEnabled(cfg.AUTO_ONLINE, false) && configEnabled(cfg.AUTO_RECORDING, false)) {
         await socket.sendPresenceUpdate('recording', message.key.remoteJid);
       }
 
@@ -883,129 +1077,131 @@ async function robustDownload(messageObj, downloader) {
 }
 async function handleMessageRevocation(socket, number) {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
-  const ownerJid  = `${sanitized}@s.whatsapp.net`;
+  const ownerJid = `${sanitized}@s.whatsapp.net`;
+  const pendingDeletes = new Map();
+  const inFlight = new Set();
+  const processed = new Map();
 
-  // ── Baileys émet parfois messages.delete ──
-  socket.ev.on('messages.delete', async ({ keys }) => {
-    if (!keys?.length) return;
-    for (const key of keys) {
-      try {
-        await processRevoke(sanitized, ownerJid, socket, key.id, key.remoteJid, key.participant);
-      } catch(e) { console.error('[AD messages.delete]', e); }
+  const eventId = key => `${key?.remoteJid || ''}:${key?.id || ''}`;
+  const alreadyProcessed = id => {
+    const timestamp = processed.get(id);
+    if (!timestamp) return false;
+    if (Date.now() - timestamp > 5 * 60 * 1000) {
+      processed.delete(id);
+      return false;
+    }
+    return true;
+  };
+  const markProcessed = id => {
+    processed.set(id, Date.now());
+    while (processed.size > 1000) processed.delete(processed.keys().next().value);
+  };
+
+  const run = async (revokedKey, revokeMessage = null) => {
+    if (!revokedKey?.id) return;
+    const id = eventId(revokedKey);
+    if (alreadyProcessed(id) || inFlight.has(id)) return;
+    inFlight.add(id);
+    try {
+      const result = await processRevoke({
+        sanitized,
+        ownerJid,
+        socket,
+        revokedKey,
+        revokeMessage
+      });
+      if (result !== 'not_found' && result !== 'error') markProcessed(id);
+    } finally {
+      inFlight.delete(id);
+    }
+  };
+
+  // messages.delete ne fournit généralement pas l'identité de la personne qui
+  // a supprimé. On attend brièvement le protocolMessage REVOKE, plus complet.
+  socket.ev.on('messages.delete', ({ keys }) => {
+    for (const key of keys || []) {
+      if (!key?.id) continue;
+      const id = eventId(key);
+      if (pendingDeletes.has(id) || alreadyProcessed(id)) continue;
+      const timer = setTimeout(() => {
+        pendingDeletes.delete(id);
+        run(key).catch(error => console.error('[AD messages.delete]', error));
+      }, 1000);
+      timer.unref?.();
+      pendingDeletes.set(id, timer);
     }
   });
 
-  // ── Mais surtout il émet messages.upsert avec protocolMessage REVOKE ──
+  // Le message protocolaire permet de distinguer la clé du message original
+  // (protocolMessage.key) de la personne ayant réellement révoqué (m.key).
   socket.ev.on('messages.upsert', async ({ messages }) => {
-    for (const m of messages) {
+    for (const revokeMessage of messages || []) {
       try {
-        if (m?.message?.protocolMessage?.type !== 0) continue; // type 0 = REVOKE
-        const revokedKey = m.message.protocolMessage.key;
-        if (!revokedKey?.id) continue;
-        await processRevoke(
-          sanitized, ownerJid, socket,
-          revokedKey.id,
-          revokedKey.remoteJid || m.key.remoteJid,
-          revokedKey.participant || m.key.participant
-        );
-      } catch(e) { console.error('[AD messages.upsert REVOKE]', e); }
+        const protocol = unwrapAntideleteMessage(revokeMessage?.message).message?.protocolMessage;
+        if (protocol?.type !== 0 || !protocol.key?.id) continue;
+        const revokedKey = {
+          ...protocol.key,
+          remoteJid: protocol.key.remoteJid || revokeMessage.key?.remoteJid
+        };
+        const id = eventId(revokedKey);
+        const pending = pendingDeletes.get(id);
+        if (pending) {
+          clearTimeout(pending);
+          pendingDeletes.delete(id);
+        }
+        await run(revokedKey, revokeMessage);
+      } catch (error) {
+        console.error('[AD messages.upsert REVOKE]', error);
+      }
     }
   });
 }
 
-// ── Fonction centrale de traitement ──
-// ── Fonction centrale de traitement Antidelete Corrigée ──
-async function processRevoke(sanitized, ownerJid, socket, msgId, chatId, participant) {
+async function processRevoke({ sanitized, ownerJid, socket, revokedKey, revokeMessage }) {
+  const msgId = revokedKey?.id;
+  const chatId = revokedKey?.remoteJid || revokeMessage?.key?.remoteJid;
+  if (!msgId || !chatId) return 'invalid';
+
   try {
     const cfg = await loadUserConfigFromMongo(sanitized) || {};
+    if (!modeAllowsChat(cfg.antidelete, chatId)) return 'ignored';
 
-    // 1. Vérification si l'antidelete est activé
-    if (!cfg.antidelete || cfg.antidelete === 'off') return;
-
-    const mode = cfg.antidelete; // 'all' | 'g' | 'p' | true
-    const isGroup   = (chatId || '').endsWith('@g.us');
-    const isPrivate = (chatId || '').endsWith('@s.whatsapp.net');
-
-    // Filtres selon la configuration
-    if (mode === 'g' && !isGroup) return; 
-    if (mode === 'p' && !isPrivate) return; 
-
-    // 2. Récupération du message original depuis la mémoire
     const deletedMsg = getStoredMessage(sanitized, msgId);
     if (!deletedMsg) {
       console.warn(`[ANTIDELETE] ${msgId} non trouvé dans le store (session ${sanitized})`);
-      return;
+      return 'not_found';
     }
 
-    // Infos de l'expéditeur et contexte
-    const senderNum    = (participant || chatId || '').split('@')[0];
-    const deletionTime = getHaitiTimestamp();
-    const contextInfo  = isGroup ? `👥 *Groupe :* ${chatId}\n` : `💬 *Privé :* ${senderNum}\n`;
-
-    // 3. Déballage récursif (Vue Unique, Éphémère, etc.)
-    let m = deletedMsg.message;
-    let isViewOnce = false;
-
-    while (m && (m.ephemeralMessage || m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension || m.documentWithCaptionMessage)) {
-      if (m.viewOnceMessage || m.viewOnceMessageV2 || m.viewOnceMessageV2Extension) {
-        isViewOnce = true;
-      }
-      m = m.ephemeralMessage?.message 
-       || m.viewOnceMessage?.message 
-       || m.viewOnceMessageV2?.message 
-       || m.viewOnceMessageV2Extension?.message 
-       || m.documentWithCaptionMessage?.message;
-    }
-
-    if (!m) {
-      console.warn(`[ANTIDELETE] Impossible de déballer la structure du message ${msgId}`);
-      return;
-    }
-
-    // ASTUCE VUE UNIQUE : On désactive le drapeau viewOnce pour que copyNForward l'envoie normalement
-    if (m.imageMessage) m.imageMessage.viewOnce = false;
-    if (m.videoMessage) m.videoMessage.viewOnce = false;
-
-    // On remplace le message d'origine par le message déballé et nettoyé
-    deletedMsg.message = m;
-
-    // En-tête d'avertissement envoyé en privé au propriétaire (ownerJid)
-    let header = `╭━━━━━━━━━━━━━━━━━━╮\n` +
-                 `┃  🗑️ *ANTIDELETE*\n` +
-                 `╰━━━━━━━━━━━━━━━━━━╯\n\n` +
-                 `👤 *Auteur :* @${senderNum}\n` +
-                 `${contextInfo}` +
-                 `⏰ *Heure  :* ${deletionTime}\n` +
-                 `${isViewOnce ? '👁️ *Type d\'origine :* Vue Unique (Convertie)\n' : ''}` +
-                 `━━━━━━━━━━━━━━━━━━\n` +
-                 `👇 *Message retransmis ci-dessous :*`;
-
-    // Envoi de l'alerte d'en-tête en privé
-    await socket.sendMessage(ownerJid, {
-      text: header,
-      mentions: [participant || chatId]
+    const authorJid = resolveOriginalAuthor(deletedMsg, chatId, ownerJid);
+    const revokerJid = resolveRevoker(revokeMessage, chatId, ownerJid, authorJid);
+    const conversationName = await resolveConversationName(socket, chatId, deletedMsg, revokeMessage);
+    const { isViewOnce } = unwrapAntideleteMessage(deletedMsg.message);
+    const mentions = uniqueMentions(revokerJid, authorJid);
+    const header = buildAntideleteHeader({
+      revokerJid,
+      authorJid,
+      conversationName,
+      timestamp: getHaitiTimestamp(),
+      isViewOnce
     });
 
-    // 4. Retransmission directe avec copyNForward vers votre privé (ownerJid)
-    if (typeof socket.copyNForward === 'function') {
-      await socket.copyNForward(ownerJid, deletedMsg, true);
-    } else {
-      // Option de secours si la fonction porte un autre nom dans votre structure
-      await socket.sendMessage(ownerJid, { forward: deletedMsg });
-    }
+    await sendRecoveredMessage({
+      socket,
+      ownerJid,
+      storedMessage: deletedMsg,
+      header,
+      mentions,
+      downloadContent: downloadContentFromMessage
+    });
 
-    // 5. Nettoyage de la mémoire du store pour ce message
-    const sessionStore = getSessionStore(sanitized);
-    if (sessionStore && sessionStore.has(msgId)) {
-      sessionStore.delete(msgId);
-    }
-
-  } catch (globalError) {
-    console.error('[ANTIDELETE FATAL ERROR] :', globalError);
+    deleteStoredMessage(sanitized, msgId);
+    return 'recovered';
+  } catch (error) {
+    // Conserver l'entrée pour permettre une nouvelle tentative si le réseau ou
+    // le téléchargement du média a échoué temporairement.
+    console.error('[ANTIDELETE FATAL ERROR]', error);
+    return 'error';
   }
-
-  // Supprimer du store après traitement
-  getSessionStore(sanitized).delete(msgId);
 }
 
 function generateTS() { return Math.floor(Date.now() / 1000); }
@@ -1178,11 +1374,13 @@ function handleGroupStatusMention(socket, sessionId) {
 }
 // ---------------- command handlers ----------------
 function setupCommandHandlers(socket, number) {
-  socket.ev.on('messages.upsert', async ({ messages }) => {
+  socket.ev.on('messages.upsert', ({ messages }) => withCommandTheme(async () => {
     const msg = messages[0];
-    // ── STORE tous les messages pour antidelete ──
+    // ── STORE des messages privés/groupes pour antidelete ──
   for (const m of messages) {
-    if (m?.key?.id && m?.message && !m.key.fromMe) {
+    if (m?.key?.id && m?.message && modeAllowsChat('all', m.key.remoteJid)) {
+      // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe est
+      // indispensable pour identifier correctement l'auteur et le suppresseur.
       storeMessage(number, m);
     }
   }
@@ -1192,6 +1390,7 @@ function setupCommandHandlers(socket, number) {
     
     const remoteJid = msg.key.remoteJid;
     if (!remoteJid) return;
+    if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
     
     // 2. Déterminer le type de message pour extraire le body
     const type = getContentType(msg.message);
@@ -1203,7 +1402,8 @@ function setupCommandHandlers(socket, number) {
     const reactionMsg = (type === 'reactionMessage') ? msg.message.reactionMessage : msg.message?.reactionMessage;
     if (reactionMsg && reactionMsg.text) {
       const emojiReact = reactionMsg.text;
-      const matchedReactCmd = findReactionCommand(emojiReact);
+      const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+      const matchedReactCmd = findReactionCommand(emojiReact, sanitizedBot);
       if (matchedReactCmd && matchedReactCmd.command) {
         const targetKey = reactionMsg.key;
         const targetMsgId = targetKey?.id;
@@ -1213,21 +1413,30 @@ function setupCommandHandlers(socket, number) {
         const reactorJid = msg.key.fromMe 
           ? (socket.user?.id ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : msg.key.remoteJid)
           : (msg.key.participant || msg.key.remoteJid);
-        const reactorNumber = (reactorJid || '').split('@')[0];
-        const isReactorOwner = reactorNumber === config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+        const reactorNumber = (reactorJid || '').split('@')[0].split(':')[0];
 
-        // Vérifier le mode privé si configuré
-        const sanitizedBot = String(socket.user?.id || '').replace(/[^0-9]/g, '');
-        const sessionCfg = await loadSessionConfigMerged(number || sanitizedBot);
-        if (sessionCfg && sessionCfg.MODE === 'private' && !isReactorOwner && reactorNumber !== sanitizedBot) {
+        // Vérifier le mode privé et les droits avec la même source que les commandes texte.
+        const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
+        const reactorIdentifiers = collectMessageIdentifiers(msg, reactorJid, reactorNumber);
+        const reactorAccess = resolveAccess({
+          identifiers: reactorIdentifiers,
+          ownerValue: config.OWNER_NUMBER,
+          adminEntries: await loadAdminsFromMongo(),
+          sudoEntries: sessionCfg.SUDO_USERS || [],
+          sessionNumber: sanitizedBot
+        });
+        const isReactorOwner = reactorAccess.isConfiguredOwner;
+        if (sessionCfg && sessionCfg.MODE === 'private' && !reactorAccess.isPrivileged) {
           return;
         }
 
-        const cmdPrefix = config.PREFIX || '.';
+        await wakeForCommand(socket, msg, sessionCfg);
+        const cmdPrefix = resolveSessionPrefix(sessionCfg, config.PREFIX || '.');
         const fullCmdStr = matchedReactCmd.command;
         const fullBody = `${cmdPrefix}${fullCmdStr}`;
         const cmdName = fullCmdStr.split(' ')[0].toLowerCase();
         const cmdArgs = fullCmdStr.split(' ').slice(1);
+        activateCommandTheme(cmdName, isOniThemeEnabled(sessionCfg.THEME));
 
         const quotedPayload = targetMsg?.message || null;
         const quotedParticipant = targetMsg?.key?.participant || targetKey?.participant || targetKey?.remoteJid;
@@ -1264,9 +1473,17 @@ function setupCommandHandlers(socket, number) {
           from: targetChat,
           sender: reactorJid,
           senderNumber: reactorNumber,
+          pushName: msg.pushName || '',
+          sessionNumber: String(number || sanitizedBot).replace(/[^0-9]/g, ''),
+          legacyCommands: [...LEGACY_COMMANDS],
           args: cmdArgs,
           body: fullBody,
           isOwner: isReactorOwner,
+          isSessionOwner: reactorAccess.isSessionOwner,
+          isMongoAdmin: reactorAccess.isMongoAdmin,
+          isSudo: reactorAccess.isSudo,
+          isPrivileged: reactorAccess.isPrivileged,
+          access: reactorAccess,
           config,
           sessionCfg,
           prefix: cmdPrefix,
@@ -1276,7 +1493,9 @@ function setupCommandHandlers(socket, number) {
           quotedSender: quotedParticipant,
           activeSockets,
           loadUserConfigFromMongo,
-          setUserConfigInMongo
+          setUserConfigInMongo,
+          getPluginsByCategory,
+          getAllPluginsList
         });
 
         if (isHandled) return;
@@ -1308,9 +1527,11 @@ function setupCommandHandlers(socket, number) {
     // Détection de Sticker Command (Sticker associé à une commande)
     const stickerMsgObj = (type === 'stickerMessage') ? msg.message.stickerMessage : msg.message?.stickerMessage;
     if (stickerMsgObj) {
-      const matchedCmd = findStickerCommand(stickerMsgObj);
+      const stickerSessionId = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+      const matchedCmd = findStickerCommand(stickerMsgObj, stickerSessionId);
       if (matchedCmd && matchedCmd.command) {
-        const cmdPrefix = config.PREFIX || '.';
+        const stickerCfg = await loadSessionConfigMerged(number || socket.user?.id);
+        const cmdPrefix = resolveSessionPrefix(stickerCfg, config.PREFIX || '.');
         body = `${cmdPrefix}${matchedCmd.command}`;
         console.log(`🎯 [STICKER-CMD] Sticker identifié ! Déclenchement automatique de : "${body}"`);
 
@@ -1340,6 +1561,34 @@ function setupCommandHandlers(socket, number) {
     const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
     const cfg = await loadSessionConfigMerged(sessionId);  // fourni par ton système MongoDB
     console.log('[HANDLER] merged cfg for', sessionId, cfg);
+
+    // Une réponse numérique en conversation privée peut finaliser le choix du
+    // groupe pour `.swgc`. Elle est traitée avant le routeur de commandes afin
+    // que l’utilisateur n’ait pas à préfixer le numéro.
+    if (!remoteJid.endsWith('@g.us') && /^\d+$/.test(normalizedBody)) {
+      const selectionActor = actorIdFromMessage(socket, msg, remoteJid);
+      const selection = resolveGroupSelection(sessionId, selectionActor, normalizedBody);
+      if (selection.status !== 'none') {
+        activateCommandTheme('swgc', isOniThemeEnabled(cfg.THEME));
+        await wakeForCommand(socket, msg, cfg);
+        if (selection.status === 'selected') {
+          await socket.sendMessage(remoteJid, {
+            text: `✅ Groupe ciblé : *${selection.group.subject}*\n\n` +
+              `Tu peux maintenant utiliser ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc <texte> ` +
+              `ou répondre à un média avec ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+          }, { quoted: msg });
+        } else if (selection.status === 'invalid') {
+          await socket.sendMessage(remoteJid, {
+            text: `❌ Choix invalide. Réponds avec un numéro entre ${selection.min} et ${selection.max}.`
+          }, { quoted: msg });
+        } else if (selection.status === 'expired') {
+          await socket.sendMessage(remoteJid, {
+            text: `⌛ La sélection a expiré. Relance ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+          }, { quoted: msg });
+        }
+        return;
+      }
+    }
     
     // --- Traitement antilink (déjà existant) ---
     if (remoteJid && remoteJid.endsWith('@g.us')) {
@@ -1434,48 +1683,85 @@ function setupCommandHandlers(socket, number) {
     }
     // --- FIN ANTI-TAG ---
 
-    // Si pas de texte, on ne peut pas traiter de commande
-    if (!body || typeof body !== 'string') return;
+    // Si le message ne contient pas de texte, il est ignoré sans accusé de lecture.
+    if (!body || typeof body !== 'string') {
+      await handleIgnoredMessage(socket, msg, cfg);
+      return;
+    }
+
     const tttFrom = remoteJid;
-    const tttSender = msg.key.fromMe 
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id) 
+    const tttSender = msg.key.fromMe
+      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
       : (msg.key.participant || remoteJid);
 
     const isTttMove = await handleTicTacToeMove(socket, msg, tttFrom, tttSender, body);
-    if (isTttMove) return; // Si c'est un coup valide, on stoppe le code ici pour ne pas chercher de commande
-    // ──────────── 
-    // 4. Vérifier si c'est une commande
-    const prefix = config.PREFIX || '.';
-    const isCmd = body && body.startsWith && body.startsWith(prefix);
-    if (!isCmd) return; // Si ce n'est pas une commande, on arrête
-    
-    const command = body.slice(prefix.length).trim().split(' ').shift().toLowerCase();
-    const args = body.trim().split(/ +/).slice(1);
-    
+    if (isTttMove) {
+      await wakeForCommand(socket, msg, cfg);
+      return;
+    }
+
+    // 4. Résoudre le préfixe de cette session. Une chaîne vide signifie
+    // "prefixless" et impose une validation du premier mot dans le registre.
+    const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
+    const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
+    if (!parsedCommand) {
+      await handleIgnoredMessage(socket, msg, cfg);
+      return;
+    }
+    const { command, args } = parsedCommand;
+    // Toutes les réponses textuelles produites dans ce contexte adoptent le
+    // thème Onigashima. AsyncLocalStorage isole les commandes concurrentes.
+    activateCommandTheme(command, isOniThemeEnabled(cfg.THEME));
+
     // 5. Récupérer les informations d'expéditeur
     const from = remoteJid;
     const sender = from;
-    const nowsender = msg.key.fromMe 
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id) 
+    const nowsender = msg.key.fromMe
+      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
       : (msg.key.participant || remoteJid);
-    const senderNumber = (nowsender || '').split('@')[0];
+    const senderNumber = (nowsender || '').split('@')[0].split(':')[0];
     const botNumber = socket.user.id ? socket.user.id.split(':')[0] : '';
-    const isOwner = senderNumber === config.OWNER_NUMBER.replace(/[^0-9]/g, '');
-    try {
-      // On récupère la configuration de la session en utilisant le botNumber (nettoyé de manière sûre)
-      const sanitizedBot = String(botNumber || '').replace(/[^0-9]/g, '');
-      const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
+    const sanitizedBot = String(number || botNumber || '').replace(/[^0-9]/g, '');
+    const sessionCfg = cfg;
 
-      // Si la session est configurée sur "private"
-      if (sessionCfg && sessionCfg.MODE === 'private') {
-        // Si l'envoyeur n'est ni le propriétaire (isOwner) ni le compte du bot lui-même
-        if (!isOwner && senderNumber !== sanitizedBot) {
-          return; // On ignore silencieusement le message, le bot ne répondra à rien
-        }
+    // WhatsApp utilise parfois un LID dans les groupes. participantAlt fournit
+    // généralement le numéro; sinon on complète depuis les métadonnées du groupe.
+    const senderIdentifiers = collectMessageIdentifiers(msg, nowsender, senderNumber);
+    if (from.endsWith('@g.us') && String(nowsender).includes('@lid')) {
+      try {
+        const metadata = await socket.groupMetadata(from);
+        const participant = (metadata?.participants || []).find(item => {
+          const values = [item.id, item.jid, item.lid, item.phoneNumber, item.pn]
+            .filter(Boolean)
+            .map(value => String(value).toLowerCase());
+          return values.some(value => senderIdentifiers.has(value));
+        });
+        if (participant) addIdentifierCandidates(senderIdentifiers, participant);
+      } catch (error) {
+        console.warn('[ACCESS] Résolution LID impossible:', error?.message || error);
       }
-    } catch (err) {
-      console.error("Erreur lors de la vérification du mode de session:", err);
     }
+
+    const mongoAdmins = await loadAdminsFromMongo();
+    const access = resolveAccess({
+      identifiers: senderIdentifiers,
+      ownerValue: config.OWNER_NUMBER,
+      adminEntries: mongoAdmins,
+      sudoEntries: sessionCfg.SUDO_USERS || [],
+      sessionNumber: sanitizedBot
+    });
+    const isOwner = access.isConfiguredOwner;
+    const { isSessionOwner, isMongoAdmin, isSudo, isPrivileged } = access;
+
+    // En mode privé, les propriétaires et admins Mongo restent autorisés.
+    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged) {
+      await handleIgnoredMessage(socket, msg, sessionCfg);
+      return;
+    }
+
+    // En AUTO_ONLINE OFF, seule une commande reconnue arrive ici : elle est
+    // explicitement marquée comme lue et réveille temporairement la présence.
+    await wakeForCommand(socket, msg, sessionCfg);
     // DEBUG: Afficher les informations pour le débogage
     console.log('DEBUG Command Handler:');
     console.log('- Remote JID:', remoteJid);
@@ -1509,24 +1795,32 @@ function setupCommandHandlers(socket, number) {
 
     // ── Exécution des plugins modulaires ──
     try {
-      const sanitizedBot = String(botNumber || '').replace(/[^0-9]/g, '');
-      const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
       const isHandled = await executePlugin(command, {
         socket,
         msg,
         from,
         sender: nowsender,
         senderNumber,
+        pushName: msg.pushName || '',
+        sessionNumber: sanitizedBot,
+        legacyCommands: [...LEGACY_COMMANDS],
         args,
         body,
         isOwner,
+        isSessionOwner,
+        isMongoAdmin,
+        isSudo,
+        isPrivileged,
+        access,
         config,
         sessionCfg,
         prefix,
         command,
         activeSockets,
         loadUserConfigFromMongo,
-        setUserConfigInMongo
+        setUserConfigInMongo,
+        getPluginsByCategory,
+        getAllPluginsList
       });
       if (isHandled) return;
     } catch (pluginErr) {
@@ -1632,10 +1926,10 @@ case 'status': {
       case 'mode': {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
 
   // Vérification de sécurité (seul le owner ou la session modifie)
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  if (!(isOwner || isSessionOwner)) {
     return await socket.sendMessage(from, { text: '❌ Seul le propriétaire peut changer le mode du bot.' }, { quoted: msg });
   }
 
@@ -3327,10 +3621,10 @@ case 'antitag': {
 case 'delsession': {
   try {
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     // Vérification : seul le Owner global peut utiliser cette commande
-    if (senderNum !== ownerNum) {
+    if (!isOwner) {
       await socket.sendMessage(sender, {
         text: '❌ Seul le propriétaire global du bot peut utiliser cette commande.'
       }, { quoted: msg });
@@ -3548,10 +3842,10 @@ case 'config': {
     const param = args.slice(1).join(' ').trim();
     const sanitized = (number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     // permission : seul le propriétaire de la session ou le bot owner peut modifier
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       const shonux = {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CONFIG_DENY1" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nEND:VCARD` } }
@@ -3600,6 +3894,21 @@ case 'config': {
         break;
       }
 
+      case 'alwaysonline':
+      case 'autoonline':
+      case 'online': {
+        const val = (args[1] || '').toLowerCase();
+        if (val === 'on' || val === 'off') {
+          cfg.AUTO_ONLINE = val === 'on';
+          await setUserConfigInMongo(sanitized, cfg);
+          await applyAlwaysOnlineSetting(socket, cfg.AUTO_ONLINE, sender);
+          await socket.sendMessage(sender, { text: `✅ ALWAYS_ONLINE : ${val.toUpperCase()}` }, { quoted: msg });
+        } else {
+          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off` }, { quoted: msg });
+        }
+        break;
+      }
+
       case 'setemoji': {
         if (!param) {
           await socket.sendMessage(sender, { text: 'Usage: .config setemoji <emoji1> <emoji2> ...' }, { quoted: msg });
@@ -3618,14 +3927,19 @@ case 'config': {
       }
 
       case 'setprefix': {
-        const newPrefix = args[1] || '';
-        if (!newPrefix) {
-          await socket.sendMessage(sender, { text: 'Usage: .config setprefix <prefix>' }, { quoted: msg });
+        const requestedPrefix = args[1];
+        if (requestedPrefix === undefined) {
+          await socket.sendMessage(sender, { text: `${prefix}config setprefix <préfixe|off>` }, { quoted: msg });
           break;
         }
+        const newPrefix = /^(?:off|none|false)$/i.test(requestedPrefix) ? '' : requestedPrefix;
         cfg.PREFIX = newPrefix;
         await setUserConfigInMongo(sanitized, cfg);
-        await socket.sendMessage(sender, { text: `✅ PREFIX set to: ${newPrefix}` }, { quoted: msg });
+        await socket.sendMessage(sender, {
+          text: newPrefix
+            ? `✅ PREFIX set to: ${newPrefix}`
+            : '✅ Mode prefixless activé. Utilise `config setprefix .` pour réactiver le point.'
+        }, { quoted: msg });
         break;
       }
 
@@ -3636,8 +3950,9 @@ case 'config': {
           AUTO_VIEW_STATUS: typeof cfg.AUTO_VIEW_STATUS === 'undefined' ? true : cfg.AUTO_VIEW_STATUS,
           AUTO_LIKE_STATUS: typeof cfg.AUTO_LIKE_STATUS === 'undefined' ? true : cfg.AUTO_LIKE_STATUS,
           AUTO_RECORDING: typeof cfg.AUTO_RECORDING === 'undefined' ? false : cfg.AUTO_RECORDING,
+          AUTO_ONLINE: typeof cfg.AUTO_ONLINE === 'undefined' ? false : cfg.AUTO_ONLINE,
           AUTO_LIKE_EMOJI: Array.isArray(cfg.AUTO_LIKE_EMOJI) && cfg.AUTO_LIKE_EMOJI.length ? cfg.AUTO_LIKE_EMOJI : ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
-          PREFIX: cfg.PREFIX || '.',
+          PREFIX: Object.prototype.hasOwnProperty.call(cfg, 'PREFIX') ? cfg.PREFIX : '.',
           antidelete: cfg.antidelete === true
         };
         const text = [
@@ -3645,8 +3960,9 @@ case 'config': {
           `AUTO_VIEW_STATUS: ${merged.AUTO_VIEW_STATUS}`,
           `AUTO_LIKE_STATUS: ${merged.AUTO_LIKE_STATUS}`,
           `AUTO_RECORDING: ${merged.AUTO_RECORDING}`,
+          `AUTO_ONLINE: ${merged.AUTO_ONLINE}`,
           `AUTO_LIKE_EMOJI: ${merged.AUTO_LIKE_EMOJI.join(' ')}`,
-          `PREFIX: ${merged.PREFIX}`,
+          `PREFIX: ${merged.PREFIX || 'off (prefixless)'}`,
           `ANTIDELETE: ${merged.antidelete ? 'ON' : 'OFF'}`
         ].join('\n');
         await socket.sendMessage(sender, { text }, { quoted: msg });
@@ -3660,8 +3976,9 @@ case 'config': {
           '.config autoview on|off',
           '.config autolike on|off',
           '.config autorec on|off',
+          '.config alwaysonline on|off',
           '.config setlikeemoji <emoji1> <emoji2> ...',
-          '.config setprefix <prefix>',
+          '.config setprefix <prefix|off>',
           '.config show'
         ].join('\n');
         await socket.sendMessage(sender, { text: help }, { quoted: msg });
@@ -3773,9 +4090,6 @@ ${prefix}goodbye reset — remettre le message par défaut`
   }
   break;
 }
-
-// Case swgc à coller dans ton switch principal
-// Utilise le module status.js et ton client nommé socket
 
 // ============================================================
 // TAKE — Renommer un sticker (titre + auteur KAIDO-MD)
@@ -4053,7 +4367,7 @@ case 'antistatusmention': {
   try {
     const sanitized = String(number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     if (!from.endsWith('@g.us')) {
       return await socket.sendMessage(sender, {
@@ -4061,7 +4375,7 @@ case 'antistatusmention': {
       }, { quoted: msg });
     }
 
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       return await socket.sendMessage(sender, {
         text: '❌ Seul le propriétaire de la session ou du bot peut changer ce mode.'
       }, { quoted: msg });
@@ -4608,7 +4922,7 @@ VERSION:3.0
 N:${botName};;;;
 FN:${botName}
 ORG:KAIDO-MD
-TEL;type=CELL;type=VOICE;waid=${config.OWNER_NUMBER.replace(/[^0-9]/g,'')}:${config.OWNER_NUMBER}
+TEL;type=CELL;type=VOICE;waid=${primaryOwnerNumber()}:${config.OWNER_NUMBER}
 END:VCARD`
         }
       }
@@ -4617,10 +4931,10 @@ END:VCARD`
     // Déterminer l'émetteur (JID et numéro)
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
     const senderNum = (String(senderJid || '').split('@')[0] || '').replace(/[^0-9]/g, '');
-    const ownerNum = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
 
     // Autorisation : seul le propriétaire de la session ou le bot owner peut forcer le bot à quitter
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       // Message en français indiquant la restriction
       await socket.sendMessage(from, {
         text: '❌ Seul le propriétaire de cette session ou le propriétaire du bot peut demander au bot de quitter le groupe.'
@@ -4984,8 +5298,8 @@ case 'setconfig': {
   try {
     // permission : seul le propriétaire de la session (number) ou le bot owner peut modifier
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = (config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    const ownerNum = primaryOwnerNumber();
+    if (!(isOwner || isSessionOwner)) {
       const meta = {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_SETCONFIG_DENIED" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY } }
@@ -5082,8 +5396,8 @@ case 'resetconfig': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   try {
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = (config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    const ownerNum = primaryOwnerNumber();
+    if (!(isOwner || isSessionOwner)) {
       const meta = {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_RESET_DENIED" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY } }
@@ -5479,9 +5793,9 @@ case 'ad': {
   try {
     const sanitized = String(number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum  = String(config.OWNER_NUMBER || '').replace(/[^0-9]/g, '');
+    const ownerNum  = primaryOwnerNumber();
 
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       await socket.sendMessage(sender, {
         text: `❌ Seul le propriétaire de la session peut modifier ce paramètre.`
       }, { quoted: msg });
@@ -5493,7 +5807,7 @@ case 'ad': {
 
     // ── Sous-commandes ──
     if (sub === 'status') {
-      const mode      = cfg.antidelete || 'off';
+      const mode = normaliseAntideleteMode(cfg.antidelete);
       const storeSize = getSessionStore(sanitized).size;
       const modeLabel = mode === 'all' ? '🌐 Tout (groupes + privé)'
                       : mode === 'g'   ? '👥 Groupes seulement'
@@ -5513,7 +5827,7 @@ case 'ad': {
 
     if (sub === 'off') {
       cfg.antidelete = 'off';
-      getSessionStore(sanitized).clear();
+      clearSessionStore(sanitized);
     } else if (sub === 'g') {
       cfg.antidelete = 'g';   // groupes seulement
     } else if (sub === 'p') {
@@ -6202,58 +6516,47 @@ case 'add': {
 
 case 'firstadmin': {
   try {
-    const args = body.trim().split(' ');
-    
-    if (args.length < 4) {
-      await socket.sendMessage(sender, { 
-        text: "🔐 **INITIALISATION ADMIN** 🔐\n\n" +
-              "❌ Format : !firstadmin <password> <numéro> <nom>\n" +
-              "💡 Exemple : !firstadmin AdminInit123 50912345678 Super Admin"
+    // L'ancien mot de passe statique a été supprimé. Seul un propriétaire
+    // reconnu peut initialiser le premier admin.
+    if (!(isOwner || isSessionOwner)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Seul le propriétaire du bot ou de la session peut initialiser un administrateur.'
       }, { quoted: msg });
       break;
     }
-    
-    const password = args[1];
-    const numero = args[2];
-    const nom = args.slice(3).join(' ');
-    
-    // Mot de passe temporaire (à changer après usage)
-    const TEMP_PASSWORD = 'admin123';
-    
-    if (password !== TEMP_PASSWORD) {
-      await socket.sendMessage(sender, { 
-        text: "❌ Mot de passe incorrect.\n" +
-              "Contactez le développeur pour obtenir le mot de passe d'initialisation."
+
+    const firstAdminArgs = body.trim().split(/\s+/);
+    if (firstAdminArgs.length < 3) {
+      await socket.sendMessage(sender, {
+        text: `🔐 *INITIALISATION ADMIN* 🔐\n\n❌ Format : ${prefix}firstadmin <numéro> <nom>\n💡 Exemple : ${prefix}firstadmin 50912345678 Super Admin`
       }, { quoted: msg });
       break;
     }
-    
+
+    const numero = firstAdminArgs[1];
+    const nom = firstAdminArgs.slice(2).join(' ');
+
     // Vérifier si des admins existent déjà
     const existingAdmins = await loadAdminsFromMongo();
     if (existingAdmins.length > 0) {
-      await socket.sendMessage(sender, { 
-        text: "⚠️ Des administrateurs existent déjà.\n" +
-              "Utilisez !addadmin après vous être connecté en tant qu'admin."
+      await socket.sendMessage(sender, {
+        text: `⚠️ Des administrateurs existent déjà.\nUtilisez ${prefix}addadmin pour en ajouter d'autres.`
       }, { quoted: msg });
       break;
     }
-    
+
     const numeroNettoye = numero.replace(/[^0-9]/g, '');
-    const jid = `${numeroNettoye}@s.whatsapp.net`;
-    
-    // Ajouter l'admin directement (sans vérification)
+    const jid = await addAdminToMongo(numeroNettoye);
     await adminsCol.updateOne(
-      { jid }, 
-      { 
-        $set: { 
-          jid, 
-          name: nom, 
-          addedAt: new Date(), 
-          addedBy: 'first_init',
-          isSuperAdmin: true 
-        } 
-      }, 
-      { upsert: true }
+      { jid },
+      {
+        $set: {
+          name: nom,
+          addedAt: new Date(),
+          addedBy: nowsender,
+          isSuperAdmin: true
+        }
+      }
     );
     
     console.log(`🎉 Premier admin initialisé : ${nom} (${jid})`);
@@ -6297,14 +6600,8 @@ case 'firstadmin': {
 
 case 'breact': {
   try {
-    // Vérification admin
-    const admins = await loadAdminsFromMongo();
-    const senderJid = nowsender;
-    const isAdmin = admins.some(adminJid => 
-      adminJid === senderJid || adminJid === senderJid.split('@')[0]
-    );
-    
-    if (!isAdmin) {
+    // Les propriétaires et les admins Mongo partagent ce droit global.
+    if (!isPrivileged) {
       await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
       await socket.sendMessage(sender, { 
         text: "❌ Accès refusé. Cette commande est réservée aux administrateurs." 
@@ -6638,10 +6935,10 @@ case 'deleteme': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   // determine who sent the command
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
 
   // Permission: only the session owner or the bot OWNER can delete this session
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  if (!(isOwner || isSessionOwner)) {
     await socket.sendMessage(sender, { text: '❌ Permission denied. Only the session owner or the bot owner can delete this session.' }, { quoted: msg });
     break;
   }
@@ -6703,22 +7000,9 @@ case 'deletemenumber': {
 
   // Permission check: only OWNER or configured admins can run this
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
 
-  let allowed = false;
-  if (senderNum === ownerNum) allowed = true;
-  else {
-    try {
-      const adminList = await loadAdminsFromMongo();
-      if (Array.isArray(adminList) && adminList.some(a => a.replace(/[^0-9]/g,'') === senderNum || a === senderNum || a === `${senderNum}@s.whatsapp.net`)) {
-        allowed = true;
-      }
-    } catch (e) {
-      console.warn('Failed checking admin list', e);
-    }
-  }
-
-  if (!allowed) {
+  if (!isPrivileged) {
     await socket.sendMessage(sender, { text: '❌ Permission denied. Only bot owner or admins can delete other sessions.' }, { quoted: msg });
     break;
   }
@@ -6783,13 +7067,7 @@ case 'deletemenumber': {
 
 
 case 'cfn': {
-  const fs = require('fs');
-
-  // Nettoyer le numéro de l’expéditeur
-  const sanitized = (senderNumber || '').replace(/[^0-9]/g, '');
-  const cfg = await loadUserConfigFromMongo(sanitized) || {};
-  const botName = cfg.botName || BOT_NAME_FANCY;
-  const logo = cfg.logo || config.RCD_IMAGE_PATH;
+  const botName = sessionCfg.botName || BOT_NAME_FANCY;
 
   // Récupérer les arguments après la commande
   const full = args.join(" ").trim();
@@ -6800,12 +7078,9 @@ case 'cfn': {
     break;
   }
 
-  // Vérifier permissions
-  const admins = await loadAdminsFromMongo();
-  const normalizedAdmins = (admins || []).map(a => (a || '').toString());
+  // Vérifier permissions avec les identités owner/admin Mongo normalisées.
   const senderIdSimple = (senderNumber || '').toString();
-  const isAdmin = normalizedAdmins.includes(sender) || normalizedAdmins.includes(senderNumber) || normalizedAdmins.includes(senderIdSimple);
-  if (!(isOwner || isAdmin)) {
+  if (!isPrivileged) {
     await socket.sendMessage(sender, { text: '❌ Permission refusée. Seul le propriétaire ou les admins configurés peuvent ajouter des chaînes.' }, { quoted: msg });
     break;
   }
@@ -6827,46 +7102,50 @@ case 'cfn': {
     }
   }
 
-  const jid = jidPart;
-  if (!jid || !jid.endsWith('@newsletter')) {
+  const jid = normaliseNewsletterJid(jidPart);
+  if (!jid) {
     await socket.sendMessage(sender, { text: '❗ JID invalide. Exemple: 120363402094635383@newsletter' }, { quoted: msg });
     break;
   }
 
-  let emojis = [];
-  if (emojisPart) {
-    emojis = emojisPart.includes(',') ? emojisPart.split(',').map(e => e.trim()) : emojisPart.split(/\s+/).map(e => e.trim());
-    if (emojis.length > 20) emojis = emojis.slice(0, 20);
-  }
+  const emojis = normaliseEmojiList(emojisPart);
 
   try {
-    if (typeof socket.newsletterFollow === 'function') {
-      await socket.newsletterFollow(jid);
-    }
-
     await addNewsletterToMongo(jid, emojis);
 
-    const emojiText = emojis.length ? emojis.join(' ') : '(ensemble par défaut)';
+    // Suivre d'abord avec la session qui a reçu la commande. Les autres
+    // sessions sont synchronisées ensuite, mais une session hors ligne ne doit
+    // plus transformer une sauvegarde réussie en faux échec global.
+    const currentResults = await syncNewsletterSockets(new Map(), jid, 'follow', [socket]);
+    const otherSockets = new Map(
+      [...activeSockets.entries()].filter(([, activeSocket]) => activeSocket && activeSocket !== socket)
+    );
+    const otherResults = await syncNewsletterSockets(otherSockets, jid, 'follow');
+    const syncResults = [...currentResults, ...otherResults];
 
-    const metaQuote = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CFN" },
-      message: { contactMessage: { displayName: botName, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
+    const emojiText = emojis.length ? emojis.join(' ') : `(défaut : ${DEFAULT_NEWSLETTER_EMOJIS.join(' ')})`;
+    const syncedSessions = new Set(syncResults.filter(result => result.ok).map(result => result.session)).size;
+    const currentFollowed = currentResults.some(result => result.ok);
+    const warning = currentFollowed
+      ? ''
+      : `\n⚠️ Sauvegarde effectuée, mais le suivi immédiat a échoué : ${currentResults[0]?.error || 'API newsletter indisponible'}`;
+    const mention = nowsender ? [nowsender] : [];
 
-    let imagePayload = String(logo).startsWith('http') ? { url: logo } : fs.readFileSync(logo);
-
-    await socket.sendMessage(sender, {
-      image: imagePayload,
-      caption: `✅ Chaîne suivie et sauvegardée !\n\nJID: ${jid}\nEmojis: ${emojiText}\nAjouté par: @${senderIdSimple}`,
-      footer: `📌 ${botName} FOLLOW CHANNEL`,
-      mentions: [sender], 
-      buttons: [{ buttonId: `${config.PREFIX}menu`, buttonText: { displayText: "📋 MENU" }, type: 1 }],
-      headerType: 4
-    }, { quoted: metaQuote });
+    // Une réponse texte standard évite le crash Baileys provoqué par certains
+    // anciens payloads image/boutons dont un JID interne était undefined.
+    await socket.sendMessage(from, {
+      text: `✅ *Chaîne sauvegardée !*\n\n` +
+        `JID : ${jid}\n` +
+        `Emojis : ${emojiText}\n` +
+        `Sessions synchronisées : ${syncedSessions}\n` +
+        `Ajouté par : @${senderIdSimple}\n` +
+        `Bot : ${botName}${warning}`,
+      mentions: mention
+    }, { quoted: msg });
 
   } catch (e) {
     console.error('cfn error', e);
-    await socket.sendMessage(sender, { text: `❌ Échec de l’ajout/suivi de la chaîne : ${e.message || e}` }, { quoted: msg });
+    await socket.sendMessage(from, { text: `❌ Échec de l’ajout/suivi de la chaîne : ${e.message || e}` }, { quoted: msg });
   }
   break;
 }
@@ -7851,14 +8130,8 @@ case 'bots': {
     const cfg = await loadUserConfigFromMongo(sanitized) || {};
     const botName = cfg.botName || BOT_NAME_FANCY;
 
-    // Vérification admin
-    const admins = await loadAdminsFromMongo();
-    const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
-    const isAdmin = admins.some(admin => 
-      admin === nowsender || admin.includes(senderIdSimple)
-    );
-
-    if (!isAdmin) {
+    // Vérification owner/admin Mongo déjà normalisée au début du handler.
+    if (!isPrivileged) {
       await socket.sendMessage(sender, { 
         text: '❌ Accès réservé aux administrateurs.' 
       }, { quoted: msg });
@@ -8096,9 +8369,9 @@ case 'ig': {
   try {
     const sanitized = (number || '').replace(/[^0-9]/g, '');
     const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+    const ownerNum = primaryOwnerNumber();
     // permission : seul le propriétaire de la session ou le bot owner peut utiliser
-    if (senderNum !== sanitized && senderNum !== ownerNum) {
+    if (!(isOwner || isSessionOwner)) {
       return await socket.sendMessage(sender, { text: '❌ Permission denied. Only the session owner or bot owner can use this command.' }, { quoted: msg });
     }
 
@@ -8428,271 +8701,10 @@ ${footer}
 }
 
 
-// ================= CASE DANS TON BOT =================
-case 'swgc': {
-  try {
-    const crypto = require('crypto');
-    const { generateWAMessageContent, generateWAMessageFromContent, downloadContentFromMessage } = require('@rexxhayanasi/elaina-baileys');
+// `.swgc` est implémentée dans plugins/group/swgc.js. Le plugin est exécuté
+// avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
+// le groupe ciblé : seul groupStatusMessageV2 y est relayé.
 
-    async function groupStatus(client, jid, content) {
-      const inside = await generateWAMessageContent(content, {
-        upload: client.waUploadToServer
-      });
-      const messageSecret = crypto.randomBytes(32);
-      const m = generateWAMessageFromContent(
-        jid,
-        {
-          messageContextInfo: { messageSecret },
-          groupStatusMessageV2: {
-            message: { ...inside, messageContextInfo: { messageSecret } }
-          }
-        },
-        {}
-      );
-      await client.relayMessage(jid, m.message, { messageId: m.key.id });
-    }
-
-    function randomColor() {
-      return "#" + Math.floor(Math.random() * 16777215).toString(16).padStart(6, "0");
-    }
-
-    // Définir les variables nécessaires
-    const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    const textInput = args.join(' ').trim();
-    const jid = msg.key.remoteJid;
-    const sender = msg.key.participant || msg.key.remoteJid;
-    const isGroup = jid.endsWith('@g.us');
-    const prefix = config.PREFIX || '.';
-    
-    // IMPORTANT: On ne répond que dans le groupe ou en privé selon le contexte
-    // Si c'est un groupe, on répond dans le groupe
-    // Si c'est un message privé, on répond en privé
-    const replyJid = isGroup ? jid : sender;
-
-    // Vérifier si on est dans un groupe
-    if (!isGroup) {
-      await socket.sendMessage(sender, { 
-        text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗚𝗥𝗢𝗨𝗣𝗘 』* ❏─╮\n` +
-              `│ ✦ *Erreur* ❌\n` +
-              `│ ✦ Cette commande ne peut être utilisée\n` +
-              `│ ✦ que dans un groupe !\n` +
-              `╰─────────────────╯\n` +
-              `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 ✨`
-      }, { quoted: msg });
-      break;
-    }
-
-    // Réaction d'attente dans le groupe
-    await socket.sendMessage(jid, { react: { text: "⏳", key: msg.key } });
-
-    // Si c'est une réponse à un message
-    if (msg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
-      const quotedMessage = msg.message.extendedTextMessage.contextInfo.quotedMessage;
-      
-      // Récupérer la caption originale du média cité
-      let originalCaption = "";
-      
-      if (quotedMessage.videoMessage && quotedMessage.videoMessage.caption) {
-        originalCaption = quotedMessage.videoMessage.caption;
-      } else if (quotedMessage.imageMessage && quotedMessage.imageMessage.caption) {
-        originalCaption = quotedMessage.imageMessage.caption;
-      }
-      
-      // Construire la nouvelle caption avec le watermark stylisé
-      let finalCaption = "";
-      const watermark = `\n\n━━━━━━━━━━━━━━\n✨ *𝗽𝗼𝘀𝘁𝗲𝗱 𝗯𝘆* ✨\n🐉 *𝐊𝐚𝐢𝐝𝐨-𝐌𝐃* 🐉`;
-      
-      if (originalCaption && textInput) {
-        finalCaption = `📝 *𝗖𝗮𝗽𝘁𝗶𝗼𝗻 𝗼𝗿𝗶𝗴𝗶𝗻𝗮𝗹𝗲* 📝\n❝ ${originalCaption} ❞\n\n💬 *𝗧𝗲𝘅𝘁𝗲 𝗮𝗷𝗼𝘂𝘁é* 💬\n❝ ${textInput} ❞${watermark}`;
-      } else if (originalCaption) {
-        finalCaption = `📝 *𝗖𝗮𝗽𝘁𝗶𝗼𝗻* 📝\n❝ ${originalCaption} ❞${watermark}`;
-      } else if (textInput) {
-        finalCaption = `💬 *𝗧𝗲𝘅𝘁𝗲* 💬\n❝ ${textInput} ❞${watermark}`;
-      } else {
-        finalCaption = `✨ *𝗦𝘁𝗮𝘁𝘂𝘁 𝗱𝗲 𝗴𝗿𝗼𝘂𝗽𝗲* ✨${watermark}`;
-      }
-      
-      // Traitement vidéo
-      if (quotedMessage.videoMessage) {
-        const videoMsg = quotedMessage.videoMessage;
-        
-        const stream = await downloadContentFromMessage(videoMsg, 'video');
-        const chunks = [];
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-        const buffer = Buffer.concat(chunks);
-        
-        const payload = {
-          video: buffer,
-          caption: finalCaption,
-          mimetype: videoMsg.mimetype || 'video/mp4',
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        // Confirmation dans le groupe UNIQUEMENT
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗩𝗜𝗗𝗘𝗢 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-      // Traitement image
-      else if (quotedMessage.imageMessage) {
-        const imgMsg = quotedMessage.imageMessage;
-        const stream = await downloadContentFromMessage(imgMsg, 'image');
-        const chunks = [];
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-        const buffer = Buffer.concat(chunks);
-        
-        const payload = {
-          image: buffer,
-          caption: finalCaption,
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗜𝗠𝗔𝗚𝗘 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-      // Traitement audio
-      else if (quotedMessage.audioMessage) {
-        const audioMsg = quotedMessage.audioMessage;
-        const stream = await downloadContentFromMessage(audioMsg, 'audio');
-        const chunks = [];
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-        const buffer = Buffer.concat(chunks);
-        
-        const payload = {
-          audio: buffer,
-          mimetype: audioMsg.mimetype || 'audio/mp4',
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        // Envoyer le texte séparément si présent
-        if (finalCaption) {
-          await socket.sendMessage(jid, {
-            text: finalCaption
-          });
-        }
-        
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗔𝗨𝗗𝗜𝗢 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-      // Message texte cité
-      else {
-        let quotedText = "";
-        if (quotedMessage.conversation) {
-          quotedText = quotedMessage.conversation;
-        } else if (quotedMessage.extendedTextMessage?.text) {
-          quotedText = quotedMessage.extendedTextMessage.text;
-        }
-        
-        const textToUse = textInput || quotedText;
-        
-        if (!textToUse) {
-          throw new Error("Aucun texte à publier");
-        }
-        
-        const finalText = `❝ ${textToUse} ❞${watermark}`;
-        
-        const payload = {
-          text: finalText,
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗧𝗘𝗫𝗧𝗘 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-    } 
-    else if (textInput) {
-      // Message texte simple sans citation
-      const watermark = `\n\n━━━━━━━━━━━━━━\n✨ *𝗽𝗼𝘀𝘁𝗲𝗱 𝗯𝘆* ✨\n⚡ *𝐊𝐚𝐢𝐝𝐨-𝐌𝐃* 🐉`;
-      const finalText = `💬 *𝗠𝗲𝘀𝘀𝗮𝗴𝗲* 💬\n❝ ${textInput} ❞${watermark}`;
-      
-      const payload = {
-        text: finalText,
-        backgroundColor: randomColor()
-      };
-      
-      await groupStatus(socket, jid, payload);
-      
-      await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-      await socket.sendMessage(jid, { 
-        text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗧𝗘𝗫𝗧𝗘 』* ❏─╮\n` +
-              `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-              `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-              `╰─────────────────╯\n` +
-              `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-        mentions: [sender]
-      });
-    }
-    else {
-      await socket.sendMessage(jid, { 
-        text: `╭─❏ *『 𝗘𝗥𝗥𝗘𝗨𝗥 』* ❏─╮\n` +
-              `│ ✦ *𝗨𝘀𝗮𝗴𝗲 𝗶𝗻𝗰𝗼𝗿𝗿𝗲𝗰𝘁* ❌\n` +
-              `│ ✦ 𝙴𝚡𝚎𝚖𝚙𝚕𝚎 : ${prefix}${command} 𝚂𝚊𝚕𝚞𝚝\n` +
-              `│ ✦ 𝙾𝚞 𝚛é𝚙𝚘𝚗𝚍 𝚊̀ 𝚞𝚗 𝚖é𝚍𝚒𝚊\n` +
-              `╰─────────────────╯\n` +
-              `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`
-      }, { quoted: msg });
-      await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
-    }
-
-  } catch (e) {
-    console.error('[SWGC ERROR]:', e);
-    const jid = msg?.key?.remoteJid;
-    const sender = msg?.key?.participant || msg?.key?.remoteJid;
-    const isGroup = jid?.endsWith('@g.us');
-    const replyJid = isGroup ? jid : sender;
-    
-    await socket.sendMessage(replyJid, { react: { text: "❌", key: msg.key } });
-    await socket.sendMessage(replyJid, { 
-      text: `╭─❏ *『 𝗘𝗥𝗥𝗘𝗨𝗥 』* ❏─╮\n` +
-            `│ ✦ *𝗨𝗻𝗲 𝗲𝗿𝗿𝗲𝘂𝗿 𝗲𝘀𝘁 𝘀𝘂𝗿𝘃𝗲𝗻𝘂𝗲* ❌\n` +
-            `│ ✦ 𝙳é𝚝𝚊𝚒𝚕 : ${e.message}\n` +
-            `╰─────────────────╯\n` +
-            `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`
-    });
-  }
-  break;
-}
 // ==================== DOWNLOAD MENU ====================
 
 
@@ -8880,8 +8892,8 @@ END:VCARD`;
   break;
 }
         case 'unfollow': {
-  const jid = args[0] ? args[0].trim() : null;
-  if (!jid) {
+  const requestedJid = args[0] ? args[0].trim() : null;
+  if (!requestedJid) {
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
     const title = userCfg.botName || 'NIKKA MINI BOT AI';
@@ -8894,11 +8906,7 @@ END:VCARD`;
     return await socket.sendMessage(sender, { text: '❗ Provide channel JID to unfollow. Example:\n.unfollow 120363396379901844@newsletter' }, { quoted: shonux });
   }
 
-  const admins = await loadAdminsFromMongo();
-  const normalizedAdmins = admins.map(a => (a || '').toString());
-  const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
-  const isAdmin = normalizedAdmins.includes(nowsender) || normalizedAdmins.includes(senderNumber) || normalizedAdmins.includes(senderIdSimple);
-  if (!(isOwner || isAdmin)) {
+  if (!isPrivileged) {
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
     const title = userCfg.botName || 'NIKKA MINI BOT AI';
@@ -8909,7 +8917,8 @@ END:VCARD`;
     return await socket.sendMessage(sender, { text: '❌ Permission denied. Only owner or admins can remove channels.' }, { quoted: shonux });
   }
 
-  if (!jid.endsWith('@newsletter')) {
+  const jid = normaliseNewsletterJid(requestedJid);
+  if (!jid) {
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
     const title = userCfg.botName || 'NIKKA MINI BOT AI';
@@ -8921,10 +8930,8 @@ END:VCARD`;
   }
 
   try {
-    if (typeof socket.newsletterUnfollow === 'function') {
-      await socket.newsletterUnfollow(jid);
-    }
     await removeNewsletterFromMongo(jid);
+    await syncNewsletterSockets(activeSockets, jid, 'unfollow', [socket]);
 
     let userCfg = {};
     try { if (number && typeof loadUserConfigFromMongo === 'function') userCfg = await loadUserConfigFromMongo((number || '').replace(/[^0-9]/g, '')) || {}; } catch(e){ userCfg = {}; }
@@ -10158,10 +10165,10 @@ case 'jid': {
 case 'setpath': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
+  const ownerNum = primaryOwnerNumber();
   
   // Vérification des permissions
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  if (!(isOwner || isSessionOwner)) {
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH1" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
@@ -10301,8 +10308,8 @@ case 'showconfig': {
 case 'resetconfig': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
-  const ownerNum = config.OWNER_NUMBER.replace(/[^0-9]/g, '');
-  if (senderNum !== sanitized && senderNum !== ownerNum) {
+  const ownerNum = primaryOwnerNumber();
+  if (!(isOwner || isSessionOwner)) {
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_RESETCONFIG1" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
@@ -10342,19 +10349,15 @@ case 'resetconfig': {
       try { await socket.sendMessage(sender, { image: { url: config.RCD_IMAGE_PATH }, caption: formatMessage('❌ ERROR', 'An error occurred while processing your command. Please try again.', BOT_NAME_FANCY) }); } catch(e){}
     }
 
-  });
+  }));
 }
 
 // ---------------- message handlers ----------------
 
-function setupMessageHandlers(socket) {
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message || msg.key.remoteJid === 'status@broadcast' || msg.key.remoteJid === config.NEWSLETTER_JID) return;
-    if (config.AUTO_RECORDING === 'true') {
-      try { await socket.sendPresenceUpdate('recording', msg.key.remoteJid); } catch (e) {}
-    }
-  });
+function setupMessageHandlers() {
+  // La présence et les accusés de lecture sont gérés après reconnaissance de la
+  // commande dans setupCommandHandlers. Ne rien envoyer ici évite de réveiller
+  // le compte pour un message ordinaire lorsque AUTO_ONLINE est désactivé.
 }
 
 // ---------------- cleanup helper ----------------
@@ -10368,7 +10371,7 @@ async function deleteSessionAndCleanup(number, socketInstance) {
     try { await removeSessionFromMongo(sanitized); } catch(e){}
     try { await removeNumberFromMongo(sanitized); } catch(e){}
     try {
-      const ownerJid = `${config.OWNER_NUMBER.replace(/[^0-9]/g,'')}@s.whatsapp.net`;
+      const ownerJid = `${primaryOwnerNumber()}@s.whatsapp.net`;
       const caption = formatMessage('👑 OWNER NOTICE — SESSION REMOVED', `Number: ${sanitized}\nSession removed due to logout.\n\nActive sessions now: ${activeSockets.size}`, BOT_NAME_FANCY);
       if (socketInstance && socketInstance.sendMessage) await socketInstance.sendMessage(ownerJid, { image: { url: config.RCD_IMAGE_PATH }, caption });
     } catch(e){}
@@ -10441,12 +10444,14 @@ async function EmpirePair(number, res) {
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
+  const initialSessionCfg = await loadSessionConfigMerged(sanitizedNumber).catch(() => ({ ...DEFAULT_SESSION_CONFIG }));
 
  try {
     const socket = makeWASocket({
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       printQRInTerminal: false,
       logger,
+      markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
       browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
@@ -10455,6 +10460,7 @@ async function EmpirePair(number, res) {
 socketCreationTime.set(sanitizedNumber, Date.now());
 socket.downloadMediaMessage = (m, filename) => downloadMediaMessage(m, filename)
 await setupTranslationWrapper(socket, sanitizedNumber);
+setupCommandThemeWrapper(socket);
 // ============================================================
 setupStatusHandlers(socket, sanitizedNumber);
 setupCommandHandlers(socket, sanitizedNumber);
@@ -10505,6 +10511,8 @@ handleMessageRevocation(socket, sanitizedNumber);
         reconnectAttempts.delete(sanitizedNumber);
         lastConnectionActivity.set(sanitizedNumber, Date.now());
         try {
+          const presenceCfg = await loadSessionConfigMerged(sanitizedNumber, true);
+          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
           const groupResult = await joinGroup(socket).catch(()=>({ status: 'failed', error: 'joinGroup not configured' }));
@@ -10560,7 +10568,7 @@ handleMessageRevocation(socket, sanitizedNumber);
 🔢 Numéro : ${sanitizedNumber}
 🕒 Connecté : ${getHaitiTimestamp()}
 
-Le bot est maintenant en ligne et fonctionnel.`,
+Le bot est maintenant connecté et fonctionnel.`,
   useBotName
 );
 
@@ -10595,6 +10603,7 @@ Le bot est maintenant en ligne et fonctionnel.`,
           //await sendAdminConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
          // await sendOwnerConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
           await addNumberToMongo(sanitizedNumber);
+          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
 
         } catch (e) { 
           console.error('Connection open error:', e); 
@@ -10644,22 +10653,33 @@ Le bot est maintenant en ligne et fonctionnel.`,
 // ---------------- endpoints (admin/newsletter management + others) ----------------
 
 router.post('/newsletter/add', async (req, res) => {
-  const { jid, emojis } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
-  if (!jid.endsWith('@newsletter')) return res.status(400).send({ error: 'Invalid newsletter jid' });
+  const jid = normaliseNewsletterJid(req.body?.jid);
+  const emojis = normaliseEmojiList(req.body?.emojis);
+  if (!jid) return res.status(400).send({ error: 'JID de chaîne invalide' });
   try {
-    await addNewsletterToMongo(jid, Array.isArray(emojis) ? emojis : []);
-    res.status(200).send({ status: 'ok', jid });
+    const saved = await addNewsletterToMongo(jid, emojis);
+    const synchronization = await syncNewsletterSockets(activeSockets, jid, 'follow');
+    res.status(200).send({
+      status: 'ok',
+      ...saved,
+      synchronized: synchronization.filter(result => result.ok).length,
+      failures: synchronization.filter(result => !result.ok && !result.skipped)
+    });
   } catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
 
 router.post('/newsletter/remove', async (req, res) => {
-  const { jid } = req.body;
-  if (!jid) return res.status(400).send({ error: 'jid required' });
+  const jid = normaliseNewsletterJid(req.body?.jid);
+  if (!jid) return res.status(400).send({ error: 'JID de chaîne invalide' });
   try {
     await removeNewsletterFromMongo(jid);
-    res.status(200).send({ status: 'ok', jid });
+    const synchronization = await syncNewsletterSockets(activeSockets, jid, 'unfollow');
+    res.status(200).send({
+      status: 'ok',
+      jid,
+      synchronized: synchronization.filter(result => result.ok).length
+    });
   } catch (e) { res.status(500).send({ error: e.message || e }); }
 });
 
@@ -10678,9 +10698,9 @@ router.post('/admin/add', async (req, res) => {
   const { jid } = req.body;
   if (!jid) return res.status(400).send({ error: 'jid required' });
   try {
-    await addAdminToMongo(jid);
-    res.status(200).send({ status: 'ok', jid });
-  } catch (e) { res.status(500).send({ error: e.message || e }); }
+    const normalizedJid = await addAdminToMongo(jid);
+    res.status(200).send({ status: 'ok', jid: normalizedJid });
+  } catch (e) { res.status(400).send({ error: e.message || e }); }
 });
 
 

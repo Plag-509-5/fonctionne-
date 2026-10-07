@@ -25,7 +25,7 @@ module.exports = {
     // Newsletters & Sécurité
     NEWSLETTER_JID: process.env.NEWSLETTER_JID || '120363421675697127@newsletter',
     OTP_EXPIRY: 300000,
-    ADMIN_PASS: process.env.ADMIN_PASS || 'adminplag',
+    ADMIN_PASS: process.env.ADMIN_PASS || '',
     
     // Base de données MongoDB
     MONGO_URI: process.env.MONGO_URI || process.env.MONGODB_URI || 'mongodb+srv://test2_db_user:cSq3iGhurIFh9xpp@clusterrender.v8sosxk.mongodb.net/?appName=Clusterrender',

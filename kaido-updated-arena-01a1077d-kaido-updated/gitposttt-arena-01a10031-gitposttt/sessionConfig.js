@@ -6,8 +6,12 @@ const DEFAULT_SESSION_CONFIG = {
   AUTO_VIEW_STATUS: true,
   AUTO_LIKE_STATUS: true,
   AUTO_RECORDING: false,
+  AUTO_ONLINE: false,
   AUTO_LIKE_EMOJI: ['🐉','🔥','💀','👑','💪','😎','🥶','⚡','🩸','❤️'],
-  PREFIX: '.'
+  PREFIX: '.',
+  MODE: 'public',
+  THEME: 'onigashima',
+  SUDO_USERS: []
 };
 
 // clés autorisées à modifier via setconfig

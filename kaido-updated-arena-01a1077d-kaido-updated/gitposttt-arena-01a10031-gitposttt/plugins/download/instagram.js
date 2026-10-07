@@ -1,63 +1,56 @@
-const axios = require('axios');
+'use strict';
 
-async function downloadInstagram(url) {
-  try {
-    const res = await axios.get(`https://api.giftedtech.web.id/api/download/instagram?apikey=gifted&url=${encodeURIComponent(url)}`, { timeout: 20000 });
-    if (res.data?.result) {
-      const media = Array.isArray(res.data.result) ? res.data.result : [res.data.result];
-      return media;
-    }
-  } catch (e) {}
-
-  // Fallback API
-  try {
-    const res = await axios.get(`https://api.nexoracle.com/downloader/insta?url=${encodeURIComponent(url)}&apikey=free_key`, { timeout: 20000 });
-    if (res.data?.result) {
-      return Array.isArray(res.data.result) ? res.data.result : [{ url: res.data.result.url || res.data.result }];
-    }
-  } catch (e) {}
-
-  throw new Error('Impossible de télécharger le média Instagram. Lien privé ou expiré.');
-}
+const { downloadInstagram, isHttpUrl } = require('../../services/media-api');
 
 module.exports = {
   name: 'instagram',
   alias: ['ig', 'reels', 'insta', 'igdl'],
   category: 'download',
-  description: 'Télécharge une vidéo, reel ou photo depuis Instagram',
+  description: 'Télécharge une vidéo, un reel ou un carrousel Instagram public',
   usage: '.ig <lien Instagram>',
   async execute({ socket, msg, from, args, prefix }) {
-    const url = args[0];
-    if (!url || !url.includes('instagram.com')) {
-      return await socket.sendMessage(from, {
+    const url = args[0]?.trim();
+    if (!isHttpUrl(url) || !/(^|\.)instagram\.com$/i.test(new URL(url).hostname)) {
+      return socket.sendMessage(from, {
         text: `📸 *Usage :* \`${prefix}ig https://www.instagram.com/reel/...\``
       }, { quoted: msg });
     }
 
-    await socket.sendMessage(from, { text: '⏳ *Téléchargement du média Instagram...*' }, { quoted: msg });
-
+    await socket.sendMessage(from, { react: { text: '⏳', key: msg.key } });
     try {
-      const mediaList = await downloadInstagram(url);
+      const result = await downloadInstagram(url);
+      const media = (result.media || []).filter((item) => isHttpUrl(item.url)).slice(0, 8);
+      if (!media.length) throw new Error('Aucun média exploitable trouvé dans cette publication.');
 
-      for (const item of mediaList.slice(0, 5)) {
-        const itemUrl = typeof item === 'string' ? item : (item.url || item.download_url);
-        if (!itemUrl) continue;
-
-        if (itemUrl.includes('.mp4') || (item.type && item.type.includes('video'))) {
+      let sent = 0;
+      for (const item of media) {
+        if (item.type === 'image') {
           await socket.sendMessage(from, {
-            video: { url: itemUrl },
-            caption: '📸 *Instagram Reel/Vidéo* — 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃'
+            image: { url: item.url },
+            caption: `📸 *Instagram Photo* — KAIDO-MD\n${result.title || ''}`.trim()
+          }, { quoted: msg });
+        } else if (item.type === 'audio') {
+          await socket.sendMessage(from, {
+            audio: { url: item.url },
+            mimetype: 'audio/mpeg'
           }, { quoted: msg });
         } else {
           await socket.sendMessage(from, {
-            image: { url: itemUrl },
-            caption: '📸 *Instagram Photo* — 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃'
+            video: { url: item.url },
+            mimetype: 'video/mp4',
+            caption: `📸 *Instagram Reel/Vidéo* — KAIDO-MD\n${result.title || ''}`.trim()
           }, { quoted: msg });
         }
+        sent += 1;
       }
-    } catch (err) {
-      console.error('[INSTAGRAM ERROR]', err);
-      await socket.sendMessage(from, { text: `❌ ${err.message}` }, { quoted: msg });
+
+      await socket.sendMessage(from, { react: { text: sent ? '✅' : '❌', key: msg.key } });
+    } catch (error) {
+      console.error('[INSTAGRAM ERROR]', error.message || error);
+      await socket.sendMessage(from, { react: { text: '❌', key: msg.key } }).catch(() => {});
+      await socket.sendMessage(from, {
+        text: `❌ Téléchargement Instagram impossible : ${error.message || error}\n_Vérifie que la publication est publique._`
+      }, { quoted: msg });
     }
   }
 };

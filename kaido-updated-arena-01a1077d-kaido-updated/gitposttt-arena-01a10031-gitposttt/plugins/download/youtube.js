@@ -1,91 +1,140 @@
+'use strict';
+
 const yts = require('yt-search');
-const axios = require('axios');
 const { ytmp3, ytmp4 } = require('../../youtube');
+const { requestCobalt, isHttpUrl } = require('../../services/media-api');
 
-async function downloadYoutubeAudio(query) {
-  let searchResult;
-  if (query.startsWith('http')) {
-    searchResult = await yts({ videoId: yts.getVideoId(query) }).catch(() => null);
-  }
-  if (!searchResult) {
-    const res = await yts(query);
-    searchResult = res.videos && res.videos[0] ? res.videos[0] : null;
-  }
-  if (!searchResult) throw new Error('Aucun résultat trouvé sur YouTube.');
-
-  const videoUrl = searchResult.url;
-  let dlData = null;
-
+function extractYoutubeId(value) {
   try {
-    dlData = await ytmp3(videoUrl);
-  } catch (e) {
-    // Fallback API
-    const fallbackRes = await axios.get(`https://api.giftedtech.web.id/api/download/ytmp3?apikey=gifted&url=${encodeURIComponent(videoUrl)}`).catch(() => null);
-    if (fallbackRes?.data?.result?.download_url) {
-      dlData = {
-        titre: fallbackRes.data.result.title || searchResult.title,
-        lien: fallbackRes.data.result.download_url,
-        miniature: searchResult.thumbnail
-      };
+    const url = new URL(value);
+    if (url.hostname === 'youtu.be') return url.pathname.split('/').filter(Boolean)[0] || null;
+    if (/(^|\.)youtube\.com$/i.test(url.hostname)) {
+      return url.searchParams.get('v')
+        || url.pathname.match(/\/(?:shorts|embed)\/([A-Za-z0-9_-]{11})/)?.[1]
+        || null;
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function resolveYoutube(query, search = yts) {
+  const direct = isHttpUrl(query);
+  if (direct) {
+    const id = extractYoutubeId(query);
+    if (!id) throw new Error('Lien YouTube invalide.');
+    const details = await search({ videoId: id }).catch(() => null);
+    return {
+      url: query,
+      title: details?.title || 'YouTube Media',
+      duration: details?.timestamp || 'N/A',
+      views: details?.views || 'N/A',
+      author: details?.author?.name || 'Inconnu',
+      thumbnail: details?.thumbnail || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`
+    };
+  }
+
+  const result = await search(query);
+  const video = result?.videos?.[0];
+  if (!video?.url) throw new Error('Aucun résultat trouvé sur YouTube.');
+  return {
+    url: video.url,
+    title: video.title || 'YouTube Media',
+    duration: video.timestamp || 'N/A',
+    views: video.views || 'N/A',
+    author: video.author?.name || 'Inconnu',
+    thumbnail: video.thumbnail || null
+  };
+}
+
+function normaliseLegacyDownload(raw, metadata) {
+  const url = raw?.downloadUrl || raw?.lien || raw?.url || raw?.download_url;
+  if (!isHttpUrl(url)) throw new Error('Le convertisseur n’a retourné aucun lien de téléchargement valide.');
+  return {
+    url,
+    title: raw?.title || raw?.titre || metadata.title,
+    thumbnail: raw?.thumbnail || raw?.miniature || metadata.thumbnail
+  };
+}
+
+async function downloadYoutubeVideo(metadata, dependencies = {}) {
+  const converter = dependencies.ytmp4 || ytmp4;
+  try {
+    return normaliseLegacyDownload(await converter(metadata.url, '720'), metadata);
+  } catch (legacyError) {
+    const cobalt = dependencies.requestCobalt || requestCobalt;
+    try {
+      const result = await cobalt(metadata.url, {
+        downloadMode: 'auto',
+        videoQuality: '720',
+        fallbackType: 'video'
+      });
+      const video = result.media?.find((item) => item.type === 'video') || result.media?.[0];
+      if (!isHttpUrl(video?.url)) throw new Error('aucun lien vidéo');
+      return { url: video.url, title: result.title || metadata.title, thumbnail: metadata.thumbnail };
+    } catch (fallbackError) {
+      throw new Error(`Conversion vidéo impossible (${legacyError.message}; secours: ${fallbackError.message}).`);
     }
   }
+}
 
-  if (!dlData || !dlData.lien) throw new Error('Impossible de générer le lien de téléchargement audio.');
-
-  return {
-    title: dlData.titre || searchResult.title,
-    duration: searchResult.timestamp || 'N/A',
-    views: searchResult.views || 'N/A',
-    author: searchResult.author?.name || 'Inconnu',
-    thumbnail: dlData.miniature || searchResult.thumbnail,
-    downloadUrl: dlData.lien,
-    videoUrl
-  };
+async function downloadYoutubeAudio(metadata, dependencies = {}) {
+  const converter = dependencies.ytmp3 || ytmp3;
+  return normaliseLegacyDownload(await converter(metadata.url), metadata);
 }
 
 module.exports = {
   name: 'play',
-  alias: ['song', 'ytmp3', 'music', 'audio'],
+  alias: ['song', 'ytmp3', 'music', 'audio', 'playaudio', 'playptt', 'playvideo', 'ytmp4', 'video'],
   category: 'download',
-  description: 'Recherche et télécharge une musique depuis YouTube',
-  usage: '.play <titre de la musique ou lien YouTube>',
-  async execute({ socket, msg, from, args, prefix }) {
-    const query = args.join(' ');
+  description: 'Recherche et télécharge un audio ou une vidéo YouTube',
+  usage: '.play <titre/lien> ou .playvideo <titre/lien>',
+  async execute({ socket, msg, from, args, prefix, command, dependencies = {} }) {
+    const query = args.join(' ').trim();
     if (!query) {
-      return await socket.sendMessage(from, {
-        text: `🎵 *Usage :* \`${prefix}play Céline Dion Titanic\` ou \`${prefix}play https://youtu.be/...\``
+      return socket.sendMessage(from, {
+        text: `🎵 *Usage :* \`${prefix}${command} Céline Dion Titanic\` ou \`${prefix}${command} https://youtu.be/...\``
       }, { quoted: msg });
     }
 
-    await socket.sendMessage(from, { text: `⏳ *Recherche et conversion de :* "${query}"...` }, { quoted: msg });
+    const wantsVideo = ['playvideo', 'ytmp4', 'video'].includes(command);
+    const wantsPtt = command === 'playptt';
+    await socket.sendMessage(from, { react: { text: '⏳', key: msg.key } });
 
     try {
-      const data = await downloadYoutubeAudio(query);
+      const metadata = await resolveYoutube(query, dependencies.yts || yts);
+      const data = wantsVideo
+        ? await downloadYoutubeVideo(metadata, dependencies)
+        : await downloadYoutubeAudio(metadata, dependencies);
 
-      const caption = `╭───「 🎵 *YOUTUBE PLAY* 」───
-│ 📌 *Titre :* ${data.title}
-│ 👤 *Artiste :* ${data.author}
-│ ⏱️ *Durée :* ${data.duration}
-│ 👁️ *Vues :* ${data.views}
-│ 🔗 *Lien :* ${data.videoUrl}
-╰─────────────────────────☉`;
-
-      if (data.thumbnail) {
+      if (wantsVideo) {
         await socket.sendMessage(from, {
-          image: { url: data.thumbnail },
-          caption
+          video: { url: data.url },
+          mimetype: 'video/mp4',
+          caption: `🎬 *${data.title}*\n📺 Qualité : jusqu’à 720p\n🔗 ${metadata.url}`
+        }, { quoted: msg });
+      } else {
+        await socket.sendMessage(from, {
+          audio: { url: data.url },
+          mimetype: 'audio/mpeg',
+          ptt: wantsPtt,
+          fileName: `${data.title}.mp3`
         }, { quoted: msg });
       }
 
+      await socket.sendMessage(from, { react: { text: '✅', key: msg.key } });
+    } catch (error) {
+      console.error('[YOUTUBE DOWNLOAD ERROR]', error.message || error);
+      await socket.sendMessage(from, { react: { text: '❌', key: msg.key } }).catch(() => {});
       await socket.sendMessage(from, {
-        audio: { url: data.downloadUrl },
-        mimetype: 'audio/mp4',
-        fileName: `${data.title}.mp3`
+        text: `❌ Téléchargement YouTube impossible : ${error.message || error}`
       }, { quoted: msg });
-
-    } catch (err) {
-      console.error('[YOUTUBE DOWNLOAD ERROR]', err);
-      await socket.sendMessage(from, { text: `❌ Erreur : ${err.message}` }, { quoted: msg });
     }
+  },
+  _test: {
+    extractYoutubeId,
+    resolveYoutube,
+    normaliseLegacyDownload,
+    downloadYoutubeVideo,
+    downloadYoutubeAudio
   }
 };

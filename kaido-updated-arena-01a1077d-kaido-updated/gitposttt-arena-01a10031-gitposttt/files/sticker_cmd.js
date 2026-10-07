@@ -1,225 +1,184 @@
+'use strict';
+
 const fs = require('fs');
 const path = require('path');
-let MongoClient = null;
-try {
-  MongoClient = require('mongodb').MongoClient;
-} catch (e) {}
 
-// Chemin de persistance locale
 const LOCAL_STORE_FILE = path.join(process.cwd(), 'sticker_commands.json');
-
-// Map en mémoire pour un accès ultra-rapide sans latence
-// Structure: Map<hash, { command: string, creator: string, createdAt: number, sessionId: string }>
+// Map<sessionId::hash, { hash, command, creator, createdAt, sessionId }>
 const stickerCmds = new Map();
-
 let mongoCol = null;
 
-/**
- * Initialise le stockage local et MongoDB
- */
+function normalizeSessionId(value) {
+  const digits = String(value || '').replace(/[^0-9]/g, '');
+  return digits || 'global';
+}
+
+function scopedKey(sessionId, hash) {
+  return `${normalizeSessionId(sessionId)}::${String(hash || '')}`;
+}
+
+function cacheSticker(doc) {
+  if (!doc?.hash || !doc?.command) return;
+  const sessionId = normalizeSessionId(doc.sessionId);
+  stickerCmds.set(scopedKey(sessionId, doc.hash), { ...doc, sessionId });
+}
+
 async function initStickerDb(mongoDB) {
-  // 1. Charger depuis le fichier local JSON
   try {
     if (fs.existsSync(LOCAL_STORE_FILE)) {
-      const raw = fs.readFileSync(LOCAL_STORE_FILE, 'utf8');
-      const data = JSON.parse(raw);
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          if (item.hash && item.command) {
-            stickerCmds.set(item.hash, item);
-          }
-        }
-      }
+      const data = JSON.parse(fs.readFileSync(LOCAL_STORE_FILE, 'utf8'));
+      if (Array.isArray(data)) data.forEach(cacheSticker);
     }
-  } catch (err) {
-    console.warn('[STICKER-CMD] Impossible de lire le fichier JSON local:', err.message);
+  } catch (error) {
+    console.warn('[STICKER-CMD] Impossible de lire le fichier JSON local:', error.message);
   }
 
-  // 2. Charger depuis MongoDB si disponible
   try {
     if (mongoDB) {
       mongoCol = mongoDB.collection('sticker_commands');
-      await mongoCol.createIndex({ hash: 1 }, { unique: true });
-      const docs = await mongoCol.find({}).toArray();
-      for (const d of docs) {
-        if (d.hash && d.command) {
-          stickerCmds.set(d.hash, d);
+      await mongoCol.updateMany(
+        { $or: [{ sessionId: { $exists: false } }, { sessionId: null }, { sessionId: '' }] },
+        { $set: { sessionId: 'global' } }
+      );
+      // L'ancien index interdisait qu'un même sticker ait une commande différente
+      // dans deux sessions. Il est remplacé par un index composé par session.
+      try { await mongoCol.dropIndex('hash_1'); } catch (error) {
+        if (!['IndexNotFound', 27].includes(error?.codeName) && error?.code !== 27) {
+          console.warn('[STICKER-CMD] Suppression ancien index:', error.message);
         }
       }
+      await mongoCol.createIndex({ sessionId: 1, hash: 1 }, { unique: true });
+      const docs = await mongoCol.find({}).toArray();
+      docs.forEach(cacheSticker);
     }
-  } catch (err) {
-    console.warn('[STICKER-CMD] Erreur d\'initialisation MongoDB:', err.message);
+  } catch (error) {
+    console.warn('[STICKER-CMD] Erreur d’initialisation MongoDB:', error.message);
   }
 
   console.log(`🧩 [STICKER-CMD] ${stickerCmds.size} commande(s) sticker chargée(s) en mémoire.`);
 }
 
-/**
- * Sauvegarde synchrone/asynchrone sur disque et MongoDB
- */
 async function persistStickerCmds() {
   try {
-    const list = Array.from(stickerCmds.values());
-    fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(list, null, 2));
-  } catch (err) {
-    console.error('[STICKER-CMD] Erreur écriture JSON:', err);
+    fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(Array.from(stickerCmds.values()), null, 2));
+  } catch (error) {
+    console.error('[STICKER-CMD] Erreur écriture JSON:', error);
   }
 }
 
-/**
- * Extrait tous les identifiants uniques possibles (fileSha256, mediaKey, etc.) d'un message sticker
- * @param {Object} stickerMessage - Le stickerMessage de Baileys
- * @returns {string[]} Liste des identifiants (base64 & hex)
- */
 function extractStickerHashes(stickerMessage) {
   if (!stickerMessage) return [];
   const hashes = [];
-
-  const addVal = (val) => {
-    if (!val) return;
-    if (Buffer.isBuffer(val) || val instanceof Uint8Array) {
-      hashes.push(Buffer.from(val).toString('base64'));
-      hashes.push(Buffer.from(val).toString('hex'));
-    } else if (typeof val === 'string') {
-      hashes.push(val);
+  const addValue = value => {
+    if (!value) return;
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+      hashes.push(Buffer.from(value).toString('base64'));
+      hashes.push(Buffer.from(value).toString('hex'));
+    } else if (typeof value === 'string') {
+      hashes.push(value);
     }
   };
-
-  addVal(stickerMessage.fileSha256);
-  addVal(stickerMessage.mediaKey);
-  addVal(stickerMessage.fileEncSha256);
-
+  addValue(stickerMessage.fileSha256);
+  addValue(stickerMessage.mediaKey);
+  addValue(stickerMessage.fileEncSha256);
   return [...new Set(hashes)].filter(Boolean);
 }
 
-/**
- * Récupère le hash principal d'un sticker pour l'enregistrement
- * @param {Object} stickerMessage
- * @returns {string|null}
- */
 function getPrimaryStickerHash(stickerMessage) {
   if (!stickerMessage) return null;
-  if (stickerMessage.fileSha256) {
-    const buf = Buffer.isBuffer(stickerMessage.fileSha256) 
-      ? stickerMessage.fileSha256 
-      : Buffer.from(stickerMessage.fileSha256);
-    return buf.toString('base64');
-  }
-  if (stickerMessage.mediaKey) {
-    const buf = Buffer.isBuffer(stickerMessage.mediaKey) 
-      ? stickerMessage.mediaKey 
-      : Buffer.from(stickerMessage.mediaKey);
-    return buf.toString('base64');
-  }
-  if (stickerMessage.fileEncSha256) {
-    const buf = Buffer.isBuffer(stickerMessage.fileEncSha256) 
-      ? stickerMessage.fileEncSha256 
-      : Buffer.from(stickerMessage.fileEncSha256);
-    return buf.toString('base64');
+  for (const value of [stickerMessage.fileSha256, stickerMessage.mediaKey, stickerMessage.fileEncSha256]) {
+    if (!value) continue;
+    return Buffer.isBuffer(value) || value instanceof Uint8Array
+      ? Buffer.from(value).toString('base64')
+      : String(value);
   }
   return null;
 }
 
-/**
- * Enregistre une commande associée à un sticker
- */
 async function setStickerCommand(hash, command, creator = '', sessionId = 'global') {
   if (!hash || !command) return false;
-
-  const cleanCmd = command.trim().replace(/^[./!#]/, ''); // Retire le préfixe si présent
+  const normalizedSession = normalizeSessionId(sessionId);
+  const cleanCmd = String(command).trim().replace(/^[./!#]/, '');
+  if (!cleanCmd) return false;
   const doc = {
-    hash,
+    hash: String(hash),
     command: cleanCmd,
     creator: String(creator || ''),
-    sessionId: String(sessionId || 'global'),
+    sessionId: normalizedSession,
     createdAt: Date.now()
   };
 
-  stickerCmds.set(hash, doc);
+  stickerCmds.set(scopedKey(normalizedSession, doc.hash), doc);
   await persistStickerCmds();
-
   if (mongoCol) {
     try {
-      await mongoCol.updateOne({ hash }, { $set: doc }, { upsert: true });
-    } catch (e) {
-      console.warn('[STICKER-CMD] Erreur upsert Mongo:', e.message);
+      await mongoCol.updateOne(
+        { sessionId: normalizedSession, hash: doc.hash },
+        { $set: doc },
+        { upsert: true }
+      );
+    } catch (error) {
+      console.warn('[STICKER-CMD] Erreur upsert Mongo:', error.message);
     }
   }
-
   return true;
 }
 
-/**
- * Cherche si un sticker correspond à une commande enregistrée
- * @param {Object} stickerMessage
- * @returns {{ command: string, hash: string, creator: string }|null}
- */
-function findStickerCommand(stickerMessage) {
-  if (!stickerMessage) return null;
-  const hashes = extractStickerHashes(stickerMessage);
-
-  for (const h of hashes) {
-    if (stickerCmds.has(h)) {
-      return stickerCmds.get(h);
-    }
+function findStickerCommand(stickerMessage, sessionId = 'global') {
+  const normalizedSession = normalizeSessionId(sessionId);
+  for (const hash of extractStickerHashes(stickerMessage)) {
+    const command = stickerCmds.get(scopedKey(normalizedSession, hash));
+    if (command) return command;
   }
-
   return null;
 }
 
-/**
- * Supprime une commande associée à un sticker (par hash ou par nom de commande)
- */
-async function deleteStickerCommand(hashOrCommand) {
+async function deleteStickerCommand(hashOrCommand, sessionId = 'global') {
   if (!hashOrCommand) return false;
+  const normalizedSession = normalizeSessionId(sessionId);
+  const directKey = scopedKey(normalizedSession, hashOrCommand);
+  let targetKey = stickerCmds.has(directKey) ? directKey : null;
 
-  let targetHash = null;
-
-  if (stickerCmds.has(hashOrCommand)) {
-    targetHash = hashOrCommand;
-  } else {
-    // Chercher par nom de commande
-    const search = hashOrCommand.toLowerCase().trim().replace(/^[./!#]/, '');
-    for (const [h, item] of stickerCmds.entries()) {
-      if (item.command.toLowerCase() === search) {
-        targetHash = h;
+  if (!targetKey) {
+    const search = String(hashOrCommand).toLowerCase().trim().replace(/^[./!#]/, '');
+    for (const [key, item] of stickerCmds.entries()) {
+      if (item.sessionId === normalizedSession && String(item.command).toLowerCase() === search) {
+        targetKey = key;
         break;
       }
     }
   }
+  if (!targetKey) return false;
 
-  if (!targetHash) return false;
-
-  stickerCmds.delete(targetHash);
+  const target = stickerCmds.get(targetKey);
+  stickerCmds.delete(targetKey);
   await persistStickerCmds();
-
   if (mongoCol) {
     try {
-      await mongoCol.deleteOne({ hash: targetHash });
-    } catch (e) {
-      console.warn('[STICKER-CMD] Erreur suppression Mongo:', e.message);
+      await mongoCol.deleteOne({ sessionId: normalizedSession, hash: target.hash });
+    } catch (error) {
+      console.warn('[STICKER-CMD] Erreur suppression Mongo:', error.message);
     }
   }
-
   return true;
 }
 
-/**
- * Liste toutes les commandes de stickers enregistrées
- */
-function getAllStickerCommands() {
-  return Array.from(stickerCmds.values());
+function getAllStickerCommands(sessionId = 'global') {
+  const normalizedSession = normalizeSessionId(sessionId);
+  return Array.from(stickerCmds.values()).filter(item => item.sessionId === normalizedSession);
 }
 
-// Initialisation au chargement du module
 initStickerDb().catch(() => {});
 
 module.exports = {
   initStickerDb,
+  normalizeSessionId,
+  scopedKey,
   extractStickerHashes,
   getPrimaryStickerHash,
   setStickerCommand,
   findStickerCommand,
   deleteStickerCommand,
-  getAllStickerCommands
+  getAllStickerCommands,
+  _test: { cacheSticker, stickerCmds }
 };

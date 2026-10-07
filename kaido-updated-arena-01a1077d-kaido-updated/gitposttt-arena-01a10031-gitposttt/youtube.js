@@ -1,7 +1,6 @@
 const axios = require("axios");
 const https = require("https");
 const fetch = require("node-fetch");
-const WebSocket = require("ws");
 
 // URL principale de conversion
 const BASE_URL = "https://hub.ytconvert.org/api/download";
@@ -40,22 +39,57 @@ function construireMiniature(url, fallback = null) {
 
 // Requête principale de conversion
 async function requeteConversion(payload) {
-  const res = await axios.post(BASE_URL, payload, { headers });
+  const res = await axios.post(BASE_URL, payload, { headers, timeout: 20_000 });
+  if (!res.data || typeof res.data !== 'object') {
+    throw new Error('Réponse invalide du convertisseur YouTube.');
+  }
   return res.data;
 }
 
-// Attendre que la conversion soit prête
-async function attendrePret(statusUrl) {
-  while (true) {
-    const { data } = await axios.get(statusUrl, {
-      headers: { "User-Agent": "Mozilla/5.0" }
+function lienHttp(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function normaliserResultat(data, fallback = {}) {
+  const lien = lienHttp(data?.downloadUrl || data?.download_url || data?.lien || data?.url);
+  if (!lien) throw new Error('Le convertisseur n’a retourné aucun lien valide.');
+  const titre = data?.title || data?.titre || fallback.titre || 'YouTube Media';
+  const miniature = data?.thumbnail || data?.thumbnail_url || data?.miniature || fallback.miniature || null;
+  return {
+    ...data,
+    titre,
+    title: titre,
+    lien,
+    downloadUrl: lien,
+    miniature,
+    thumbnail: miniature
+  };
+}
+
+// Attendre que la conversion soit prête, sans boucle infinie.
+async function attendrePret(statusUrl, maxAttempts = 40) {
+  const safeStatusUrl = lienHttp(statusUrl);
+  if (!safeStatusUrl) throw new Error('URL de progression absente ou invalide.');
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const { data } = await axios.get(safeStatusUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      timeout: 12_000
     });
 
-    if (data.status === "completed" || data.downloadUrl) return data;
-    if (data.status === "error") throw new Error("L’API a renvoyé une erreur.");
-
-    await attendre(3000);
+    if (data?.downloadUrl || data?.download_url) return data;
+    if (data?.status === "error" || data?.success === false) {
+      throw new Error(data?.message || "L’API a renvoyé une erreur.");
+    }
+    await attendre(1500);
   }
+  throw new Error('Timeout : la conversion YouTube met trop de temps à répondre.');
 }
 
 // Conversion principale en MP3
@@ -65,12 +99,11 @@ async function primaireMP3(url) {
     os: "windows",
     output: { type: "audio", format: "mp3" }
   });
-  const status = await attendrePret(convert.statusUrl);
-  return {
+  const status = await attendrePret(convert.statusUrl || convert.status_url);
+  return normaliserResultat(status, {
     titre: convert.title,
-    lien: status.downloadUrl,
     miniature: construireMiniature(url)
-  };
+  });
 }
 
 // Conversion principale en MP4
@@ -80,39 +113,49 @@ async function primaireMP4(url, qualite = "720") {
     os: "windows",
     output: { type: "video", format: "mp4", quality: qualite + "p" }
   });
-  const status = await attendrePret(convert.statusUrl);
-  return {
+  const status = await attendrePret(convert.statusUrl || convert.status_url);
+  return normaliserResultat({ ...status, qualite }, {
     titre: convert.title,
-    lien: status.downloadUrl,
-    miniature: construireMiniature(url),
-    qualite
-  };
+    miniature: construireMiniature(url)
+  });
 }
 
 // Méthode secondaire
 async function secondaireTelechargement(url, type = "mp3", format = "128") {
   const params = type === "mp3" ? { format: "mp3", audio_quality: format, url } : { format, url };
-  const { data } = await axios.get("https://p.lbserver.xyz/ajax/download.php", { params });
-
-  if (!data?.progress_url) throw new Error("URL de progression introuvable.");
-
-  return new Promise((resolve) => {
-    const poll = async () => {
-      try {
-        const { data: res } = await axios.get(data.progress_url);
-        if (res.progress >= 1000) {
-          resolve({
-            titre: data.title,
-            lien: res.download_url,
-            miniature: data.info?.image
-          });
-        } else setTimeout(poll, 500);
-      } catch {
-        setTimeout(poll, 500);
-      }
-    };
-    poll();
+  const { data } = await axios.get("https://p.lbserver.xyz/ajax/download.php", {
+    params,
+    timeout: 20_000,
+    headers: { 'User-Agent': 'Mozilla/5.0' }
   });
+
+  if (data?.download_url || data?.url) {
+    return normaliserResultat(data, { titre: data.title, miniature: data.info?.image });
+  }
+  if (!lienHttp(data?.progress_url)) throw new Error("URL de progression introuvable.");
+
+  let lastError = null;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      const { data: progress } = await axios.get(data.progress_url, {
+        timeout: 12_000,
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+      if (progress?.download_url || progress?.downloadUrl) {
+        return normaliserResultat(progress, {
+          titre: data.title,
+          miniature: data.info?.image || data.thumbnail_url
+        });
+      }
+      if (progress?.success === false || progress?.status === 'error') {
+        throw new Error(progress?.message || 'La conversion secondaire a échoué.');
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await attendre(1000);
+  }
+  throw new Error(lastError?.message || 'Timeout : la conversion secondaire met trop de temps à répondre.');
 }
 
 // Méthode tertiaire (SaveNow)
@@ -181,19 +224,19 @@ async function quaternaireTelechargement(url, type = "mp3", qualite = "720") {
 // Fonction principale pour MP3
 async function ytmp3(url) {
   try {
-    return await primaireMP3(url);
+    return normaliserResultat(await primaireMP3(url));
   } catch (e1) {
     console.error(e1.message || e1);
     try {
-      return await secondaireTelechargement(url, "mp3");
+      return normaliserResultat(await secondaireTelechargement(url, "mp3"));
     } catch (e2) {
       console.error(e2.message || e2);
       try {
-        return await tertiaireTelechargement(url, "mp3");
+        return normaliserResultat(await tertiaireTelechargement(url, "mp3"));
       } catch (e3) {
         console.error(e3.message || e3);
         try {
-          return await quaternaireTelechargement(url, "mp3");
+          return normaliserResultat(await quaternaireTelechargement(url, "mp3"));
         } catch (e4) {
           console.error(e4.message || e4);
           throw new Error("Tous les serveurs ont échoué pour l’audio.");
@@ -206,21 +249,20 @@ async function ytmp3(url) {
 // Fonction principale pour MP4
 async function ytmp4(url, qualite = "720") {
   try {
-    return await primaireMP4(url, qualite);
+    return normaliserResultat(await primaireMP4(url, qualite));
   } catch (e1) {
     console.error(e1.message || e1);
     try {
-      return await secondaireTelechargement(url, "mp4", qualite);
+      return normaliserResultat(await secondaireTelechargement(url, "mp4", qualite));
     } catch (e2) {
       console.error(e2.message || e2);
-      try {
-        return await tertiaireTelechargement(url, "mp4");
-      } catch (e3) {
-        console.error(e3.message || e3);
-        throw new Error("Tous les serveurs ont échoué pour la vidéo.");
-      }
+      throw new Error(`Tous les serveurs ont échoué pour la vidéo (${e2.message || e2}).`);
     }
   }
 }
 
-module.exports = { ytmp3, ytmp4 };
+module.exports = {
+  ytmp3,
+  ytmp4,
+  _test: { lienHttp, normaliserResultat, extraireIdVideo, construireMiniature }
+};
