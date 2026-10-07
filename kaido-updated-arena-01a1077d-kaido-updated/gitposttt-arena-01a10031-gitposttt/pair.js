@@ -71,15 +71,6 @@ const {
   resolveGroupSelection,
   actorIdFromMessage
 } = require('./services/group-status-selector');
-const {
-  DEFAULT_CUSTOM_PAIRING_CODE,
-  sanitizePhoneNumber,
-  requestCustomPairingCode
-} = require('./services/pairing-code');
-const {
-  snapshotAuthDirectory,
-  restoreMongoAuthDocument
-} = require('./services/session-auth-files');
 const { handleAntiLink } = require('./antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('./antilink');
 const cheerio = require('cheerio');
@@ -221,17 +212,13 @@ async function initMongo() {
 
 // ---------------- Mongo helpers ----------------
 
-async function saveCredsToMongo(number, creds, authFiles = []) {
+async function saveCredsToMongo(number, creds, keys = null) {
   try {
     await initMongo();
     const sanitized = number.replace(/[^0-9]/g, '');
-    const doc = { number: sanitized, creds, authFiles, updatedAt: new Date() };
-    await sessionsCol.updateOne(
-      { number: sanitized },
-      { $set: doc, $unset: { keys: '' } },
-      { upsert: true }
-    );
-    console.log(`Saved ${authFiles.length} auth file(s) to Mongo for ${sanitized}`);
+    const doc = { number: sanitized, creds, keys, updatedAt: new Date() };
+    await sessionsCol.updateOne({ number: sanitized }, { $set: doc }, { upsert: true });
+    console.log(`Saved creds to Mongo for ${sanitized}`);
   } catch (e) { console.error('saveCredsToMongo error:', e); }
 }
 
@@ -683,15 +670,6 @@ const reconnectAttempts = new Map();
 const lastConnectionActivity = new Map();
 
 const socketCreationTime = new Map();
-
-function markSessionConnected(number, socket) {
-  const sanitized = String(number || '').replace(/[^0-9]/g, '');
-  if (!sanitized) return;
-  connectingSessions.delete(sanitized);
-  reconnectAttempts.delete(sanitized);
-  lastConnectionActivity.set(sanitized, Date.now());
-  activeSockets.set(sanitized, socket);
-}
 
 const SESSION_RECONNECT_BASE_MS = Math.max(2000, Number(process.env.SESSION_RECONNECT_BASE_MS) || 5000);
 const SESSION_RECONNECT_MAX_MS = Math.max(30000, Number(process.env.SESSION_RECONNECT_MAX_MS) || 120000);
@@ -10403,19 +10381,13 @@ async function deleteSessionAndCleanup(number, socketInstance) {
 
 // ---------------- auto-restart ----------------
 
-function setupAutoRestart(socket, number, persistAuth) {
+function setupAutoRestart(socket, number) {
   const sanitized = String(number).replace(/[^0-9]/g, '');
   lastConnectionActivity.set(sanitized, Date.now());
   socket.ev.on('connection.update', async (update) => {
     lastConnectionActivity.set(sanitized, Date.now());
     const { connection, lastDisconnect } = update;
     if (connection === 'close') {
-      connectingSessions.delete(sanitized);
-      activeSockets.delete(sanitized);
-      socketCreationTime.delete(sanitized);
-      try { if (typeof persistAuth === 'function') await persistAuth(); } catch (error) {
-        console.warn(`[SESSION ${sanitized}] Dernière sauvegarde auth impossible:`, error?.message || error);
-      }
       const statusCode = lastDisconnect?.error?.output?.statusCode
                          || lastDisconnect?.error?.statusCode
                          || (lastDisconnect?.error && lastDisconnect.error.toString().includes('401') ? 401 : undefined);
@@ -10448,50 +10420,66 @@ function setupAutoRestart(socket, number, persistAuth) {
 // ---------------- EmpirePair (pairing, temp dir, persist to Mongo) ----------------
 
 async function EmpirePair(number, res) {
-  const sanitizedNumber = sanitizePhoneNumber(number);
+  const sanitizedNumber = String(number).replace(/[^0-9]/g, '');
+  if (!sanitizedNumber) throw new Error('Numéro de session invalide');
   if (activeSockets.has(sanitizedNumber) || connectingSessions.has(sanitizedNumber)) {
     if (res && !res.headersSent) res.send({ status: 'already_connected_or_connecting', number: sanitizedNumber });
     return;
   }
   connectingSessions.add(sanitizedNumber);
   // Libère un verrou abandonné (pairing ou réseau bloqué), sans tuer la session.
-  const connectionLockTimer = setTimeout(() => connectingSessions.delete(sanitizedNumber), 5 * 60 * 1000);
-  connectionLockTimer.unref?.();
+  setTimeout(() => connectingSessions.delete(sanitizedNumber), 90 * 1000).unref?.();
   const sessionPath = path.join(os.tmpdir(), `session_${sanitizedNumber}`);
-  let socket;
+  await initMongo().catch(()=>{});
+  // Prefill from Mongo if available
   try {
-    await initMongo().catch(() => {});
-    // Restaure tous les fichiers de clés Baileys. L’ancien code ne restaurait que
-    // creds.json et écrivait un keys.json que useMultiFileAuthState ne lit pas.
-    try {
-      const mongoDoc = await loadCredsFromMongo(sanitizedNumber);
-      const restored = await restoreMongoAuthDocument(sessionPath, mongoDoc);
-      if (restored) console.log(`Restored ${restored} auth file(s) from Mongo for ${sanitizedNumber}`);
-    } catch (e) { console.warn('Prefill from Mongo failed', e); }
+    const mongoDoc = await loadCredsFromMongo(sanitizedNumber);
+    if (mongoDoc && mongoDoc.creds) {
+      fs.ensureDirSync(sessionPath);
+      fs.writeFileSync(path.join(sessionPath, 'creds.json'), JSON.stringify(mongoDoc.creds, null, 2));
+      if (mongoDoc.keys) fs.writeFileSync(path.join(sessionPath, 'keys.json'), JSON.stringify(mongoDoc.keys, null, 2));
+      console.log('Prefilled creds from Mongo');
+    }
+  } catch (e) { console.warn('Prefill from Mongo failed', e); }
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
-    const initialSessionCfg = await loadSessionConfigMerged(sanitizedNumber).catch(() => ({ ...DEFAULT_SESSION_CONFIG }));
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
+  const initialSessionCfg = await loadSessionConfigMerged(sanitizedNumber).catch(() => ({ ...DEFAULT_SESSION_CONFIG }));
 
-    socket = makeWASocket({
+ try {
+    const socket = makeWASocket({
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+      printQRInTerminal: false,
       logger,
       markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
-      // La documentation du fork Baileys recommande un navigateur logique
-      // pour le pairing; Browsers.ubuntu évite les valeurs obsolètes codées en dur.
-      browser: Browsers.ubuntu('Chrome')
+      browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
-    socketCreationTime.set(sanitizedNumber, Date.now());
-    socket.downloadMediaMessage = (m, filename) => downloadMediaMessage(m, filename);
-    // Ce listener minimal est branché immédiatement afin de ne pas perdre un
-    // `open` très rapide lors de la restauration d’une session existante.
-    socket.ev.on('connection.update', update => {
-      if (update?.connection === 'open') markSessionConnected(sanitizedNumber, socket);
-    });
+    // Après avoir créé le socket et défini socketCreationTime
 
-    // Brancher creds.update AVANT requestPairingCode est indispensable : le
-    // fork émet immédiatement cet événement avec pairingCode et creds.me.
+socketCreationTime.set(sanitizedNumber, Date.now());
+socket.downloadMediaMessage = (m, filename) => downloadMediaMessage(m, filename)
+await setupTranslationWrapper(socket, sanitizedNumber);
+setupCommandThemeWrapper(socket);
+// ============================================================
+setupStatusHandlers(socket, sanitizedNumber);
+setupCommandHandlers(socket, sanitizedNumber);
+setupMessageHandlers(socket);
+setupAutoRestart(socket, sanitizedNumber);
+setupNewsletterHandlers(socket, sanitizedNumber);
+registerGroupParticipantListener(socket).catch(err => console.error('Listener init failed', err));
+handleMessageRevocation(socket, sanitizedNumber);
+    if (!socket.authState.creds.registered) {
+      let retries = config.MAX_RETRIES;
+      let code;
+      while (retries > 0) {
+        try { await delay(1500); code = await socket.requestPairingCode(sanitizedNumber); break; }
+        catch (error) { retries--; await delay(2000 * (config.MAX_RETRIES - retries)); }
+      }
+      if (!res.headersSent) res.send({ code });
+    }
+
+    // Save creds to Mongo when updated
     let credsSaveTimer;
     let credsSaveRunning = false;
     let credsSavePending = false;
@@ -10500,62 +10488,29 @@ async function EmpirePair(number, res) {
       credsSaveRunning = true;
       try {
         await saveCreds();
-        const authFiles = await snapshotAuthDirectory(sessionPath);
-        const credsFile = authFiles.find(file => file.name === 'creds.json');
-        const creds = credsFile ? JSON.parse(credsFile.content) : state.creds;
-        await saveCredsToMongo(sanitizedNumber, creds, authFiles);
+        const fileContent = await fs.readFile(path.join(sessionPath, 'creds.json'), 'utf8');
+        await saveCredsToMongo(sanitizedNumber, JSON.parse(fileContent), state.keys || null);
       } catch (err) { console.error('Failed saving creds:', err); }
       finally {
         credsSaveRunning = false;
         if (credsSavePending) { credsSavePending = false; persistCreds(); }
       }
     };
+    // Les mises à jour de clés peuvent être très fréquentes : regrouper les écritures
+    // protège Mongo et garde le traitement des messages réactif.
     socket.ev.on('creds.update', () => {
       clearTimeout(credsSaveTimer);
-      credsSaveTimer = setTimeout(persistCreds, 250);
+      credsSaveTimer = setTimeout(persistCreds, 750);
     });
 
-    let pairingResult = null;
-    if (!state.creds.registered && !socket.authState?.creds?.registered) {
-      try {
-        pairingResult = await requestCustomPairingCode({
-          socket,
-          state,
-          phoneNumber: sanitizedNumber,
-          customCode: config.PAIRING_CODE || DEFAULT_CUSTOM_PAIRING_CODE,
-          attempts: config.MAX_RETRIES
-        });
-        await persistCreds();
-      } catch (pairingError) {
-        clearTimeout(credsSaveTimer);
-        clearTimeout(connectionLockTimer);
-        connectingSessions.delete(sanitizedNumber);
-        socketCreationTime.delete(sanitizedNumber);
-        try { socket.end?.(pairingError); } catch (_) {}
-        if (res && !res.headersSent) {
-          res.status(502).send({ error: pairingError.message || String(pairingError) });
-        }
-        return;
-      }
-    }
-
-    await setupTranslationWrapper(socket, sanitizedNumber);
-    setupCommandThemeWrapper(socket);
-    setupStatusHandlers(socket, sanitizedNumber);
-    setupCommandHandlers(socket, sanitizedNumber);
-    setupMessageHandlers(socket);
-    setupAutoRestart(socket, sanitizedNumber, persistCreds);
-    setupNewsletterHandlers(socket, sanitizedNumber);
-    registerGroupParticipantListener(socket).catch(err => console.error('Listener init failed', err));
-    handleMessageRevocation(socket, sanitizedNumber);
 
     socket.ev.on('connection.update', async (update) => {
       const { connection } = update;
       if (connection === 'open') {
-        clearTimeout(connectionLockTimer);
-        markSessionConnected(sanitizedNumber, socket);
+        connectingSessions.delete(sanitizedNumber);
+        reconnectAttempts.delete(sanitizedNumber);
+        lastConnectionActivity.set(sanitizedNumber, Date.now());
         try {
-          await persistCreds();
           const presenceCfg = await loadSessionConfigMerged(sanitizedNumber, true);
           await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
           await delay(3000);
@@ -10571,6 +10526,7 @@ async function EmpirePair(number, res) {
             }
           } catch(e){}
 
+          activeSockets.set(sanitizedNumber, socket);
           const groupStatus = groupResult.status === 'success' ? 'Joined successfully' : `Failed to join group: ${groupResult.error}`;
 
           // Load per-session config (botName, logo)
@@ -10654,30 +10610,41 @@ Le bot est maintenant connecté et fonctionnel.`,
           try { exec(`pm2.restart ${process.env.PM2_NAME || 'NIKKA-MINI-main'}`); } catch(e) { console.error('pm2 restart failed', e); }
         }
       }
+      if (connection === 'close') {
+        const statusCode = update.lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.log(`[SESSION ${sanitizedNumber}] Connexion fermée. Code HTTP: ${statusCode}, Doit reconnecter: ${shouldReconnect}`);
+
+        activeSockets.delete(sanitizedNumber);
+        socketCreationTime.delete(sanitizedNumber);
+
+        if (shouldReconnect) {
+          console.log(`[SESSION ${sanitizedNumber}] Reconnexion automatique dans 5 secondes...`);
+          setTimeout(async () => {
+            try {
+              const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+              await EmpirePair(sanitizedNumber, mockRes);
+            } catch (err) {
+              console.error(`[SESSION ${sanitizedNumber}] Échec de la reconnexion automatique:`, err.message || err);
+            }
+          }, 5000);
+        } else {
+          console.log(`[SESSION ${sanitizedNumber}] Session fermée définitivement (Logged Out). Suppression...`);
+          try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch(e){}
+          await removeSessionFromMongo(sanitizedNumber);
+          await removeNumberFromMongo(sanitizedNumber);
+        }
+      }
+
     });
 
-    if (res && !res.headersSent) {
-      if (pairingResult?.code) {
-        res.send({
-          status: 'pairing_code_ready',
-          code: pairingResult.code,
-          pairingCode: pairingResult.code,
-          custom: pairingResult.custom
-        });
-      } else {
-        res.send({ status: 'reconnecting', number: sanitizedNumber });
-      }
-    }
+
+    activeSockets.set(sanitizedNumber, socket);
 
   } catch (error) {
     console.error('Pairing error:', error);
-    clearTimeout(connectionLockTimer);
-    connectingSessions.delete(sanitizedNumber);
     socketCreationTime.delete(sanitizedNumber);
-    try { socket?.end?.(error); } catch (_) {}
-    if (res && !res.headersSent) {
-      res.status(503).send({ error: error?.message || 'Service WhatsApp indisponible' });
-    }
+    if (!res.headersSent) res.status(503).send({ error: 'Service Unavailable' });
   }
 
 }
@@ -10760,35 +10727,27 @@ router.get('/admin/list', async (req, res) => {
 router.get('/', async (req, res) => {
   const { number } = req.query;
   if (!number) {
-    return res.sendFile(path.join(__dirname, 'main.html'));
+    return res.sendFile(path.join(process.cwd(), 'main.html'));
   }
-  try {
-    const sanitized = sanitizePhoneNumber(number);
-    if (activeSockets.has(sanitized)) return res.status(200).send({ status: 'already_connected', message: 'Cette session est déjà connectée' });
-    await EmpirePair(sanitized, res);
-  } catch (error) {
-    if (!res.headersSent) res.status(400).send({ error: error?.message || 'Numéro invalide' });
-  }
+  const sanitized = number.replace(/[^0-9]/g, '');
+  if (activeSockets.has(sanitized)) return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
+  await EmpirePair(sanitized, res);
 });
 
 router.get('/code', async (req, res) => {
   const { number } = req.query;
-  if (!number) return res.status(400).send({ error: 'Le numéro WhatsApp est obligatoire' });
-  try {
-    const sanitized = sanitizePhoneNumber(number);
-    if (activeSockets.has(sanitized)) return res.status(200).send({ status: 'already_connected', message: 'Cette session est déjà connectée' });
-    await EmpirePair(sanitized, res);
-  } catch (error) {
-    if (!res.headersSent) res.status(400).send({ error: error?.message || 'Numéro invalide' });
-  }
+  if (!number) return res.status(400).send({ error: 'Number parameter is required' });
+  const sanitized = number.replace(/[^0-9]/g, '');
+  if (activeSockets.has(sanitized)) return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
+  await EmpirePair(sanitized, res);
 });
 
 router.get('/pair', (req, res) => {
-  res.sendFile(path.join(__dirname, 'pair.html'));
+  res.sendFile(path.join(process.cwd(), 'pair.html'));
 });
 
 router.get('/delete', (req, res) => {
-  res.sendFile(path.join(__dirname, 'delete.html'));
+  res.sendFile(path.join(process.cwd(), 'delete.html'));
 });
 
 router.get('/api/session/config', async (req, res) => {

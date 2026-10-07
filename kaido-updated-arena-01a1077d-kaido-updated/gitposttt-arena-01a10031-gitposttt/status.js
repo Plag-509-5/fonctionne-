@@ -1,23 +1,43 @@
 // status.js
+const crypto = require("crypto");
+const {
+  generateWAMessageContent,
+  generateWAMessageFromContent
+} = require("@whiskeysockets/baileys");
+
+const GROUP_STATUS_MESSAGE_TYPES = [
+  "extendedTextMessage",
+  "imageMessage",
+  "videoMessage",
+  "audioMessage"
+];
 
 function isGroupJid(jid) {
   return typeof jid === "string" && jid.endsWith("@g.us");
 }
 
+function markInnerMessageAsGroupStatus(message) {
+  const next = { ...(message || {}) };
+  const messageType = GROUP_STATUS_MESSAGE_TYPES.find(type => next[type]);
+  if (!messageType) return next;
+  next[messageType] = {
+    ...next[messageType],
+    contextInfo: {
+      ...(next[messageType].contextInfo || {}),
+      isGroupStatus: true
+    }
+  };
+  return next;
+}
+
 /**
- * Publie un vrai statut rattaché au groupe.
- *
- * @itsliaaa/baileys transforme `groupStatus: true` en :
- * - groupStatusMessageV2 ;
- * - contextInfo.isGroupStatus = true sur le contenu interne ;
- * - un nœud stanza <meta is_group_status="true"/> ;
- * - le bon attribut `mediatype` pour les images, vidéos et audios.
- *
- * Le chemin natif sendMessage() évite les enveloppes relayées à la main qui
- * pouvaient être acceptées par le serveur sans rendre leur média visible.
+ * xzcbailz expose déjà les primitives nécessaires aux statuts de groupe. Le
+ * contenu média est d'abord préparé/téléversé par generateWAMessageContent,
+ * puis relayé au JID du groupe avec les deux marqueurs attendus par WhatsApp :
+ * contextInfo.isGroupStatus et <meta is_group_status="true"/>.
  */
 async function groupStatus(socket, jid, content) {
-  if (!socket || typeof socket.sendMessage !== "function") {
+  if (!socket || typeof socket.relayMessage !== "function") {
     throw new Error("Socket WhatsApp invalide.");
   }
   if (!isGroupJid(jid)) {
@@ -27,10 +47,51 @@ async function groupStatus(socket, jid, content) {
     throw new Error("Contenu de statut invalide.");
   }
 
-  return socket.sendMessage(jid, {
-    ...content,
-    groupStatus: true
+  const { backgroundColor, font, ...payload } = content;
+  const generated = await generateWAMessageContent(
+    {
+      ...payload,
+      contextInfo: {
+        ...(payload.contextInfo || {}),
+        isGroupStatus: true
+      }
+    },
+    {
+      upload: socket.waUploadToServer,
+      backgroundColor,
+      font,
+      jid
+    }
+  );
+
+  const messageSecret = crypto.randomBytes(32);
+  const inside = markInnerMessageAsGroupStatus(generated);
+  const wrapped = generateWAMessageFromContent(
+    jid,
+    {
+      messageContextInfo: { messageSecret },
+      groupStatusMessageV2: {
+        message: {
+          ...inside,
+          messageContextInfo: {
+            ...(inside.messageContextInfo || {}),
+            messageSecret
+          }
+        }
+      }
+    },
+    { userJid: socket.user?.id }
+  );
+
+  await socket.relayMessage(jid, wrapped.message, {
+    messageId: wrapped.key.id,
+    additionalNodes: [{
+      tag: "meta",
+      attrs: { is_group_status: "true" },
+      content: undefined
+    }]
   });
+  return wrapped;
 }
 
 async function buildStatusContent(m, socket, prefix, command) {
@@ -55,4 +116,9 @@ async function buildStatusContent(m, socket, prefix, command) {
   }
 }
 
-module.exports = { groupStatus, buildStatusContent, isGroupJid };
+module.exports = {
+  groupStatus,
+  buildStatusContent,
+  isGroupJid,
+  markInnerMessageAsGroupStatus
+};

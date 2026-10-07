@@ -85,7 +85,6 @@ Modifiez les variables dans `.env` :
 ```env
 PORT=3000
 BOT_NAME=KAIDO-MD
-PAIRING_CODE=KAIDOBOT
 OWNER_NUMBER=50947440869
 PREFIX=.
 # Obligatoire : accès au dashboard par mot de passe uniquement
@@ -124,8 +123,6 @@ Le serveur démarrera sur `http://localhost:3000` :
 - **Page de pairing :** `http://localhost:3000/pair`
 - **Dashboard :** `http://localhost:3000/dashboard`
 
-Le fork Baileys `@itsliaaa/baileys@0.3.18-final` accepte un code personnalisé de huit caractères. Par défaut, la page de pairing demande donc le code **`KAIDOBOT`**. Le bot attend que le WebSocket soit prêt avant de demander le code, branche `creds.update` avant cette demande et ne déclare la session active qu’après `connection: open`. Tous les fichiers créés par `useMultiFileAuthState` sont sauvegardés dans MongoDB puis restaurés au redémarrage.
-
 Le dashboard demande uniquement `ADMIN_PASS` — aucun nom d’utilisateur. Les pages et les API de gestion sont protégées par un cookie signé, `HttpOnly` et `SameSite=Strict`. Si `ADMIN_PASS` est absent, l’accès administratif est refusé plutôt que d’utiliser un mot de passe par défaut.
 
 Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`; le bot reconnaît aussi les anciens formats MongoDB et les identités WhatsApp LID lorsque le numéro alternatif est disponible. Une chaîne ajoutée depuis le dashboard est enregistrée avec les mêmes emojis que `.cfn`, puis suivie immédiatement par toutes les sessions actives.
@@ -145,7 +142,7 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 2. Réponds avec le numéro du groupe affiché.
 3. Envoie `.swgc ton texte` ou réponds à une image, vidéo ou note audio avec `.swgc`.
 
-Le bot vérifie que l’utilisateur appartient toujours au groupe avant chaque publication. Le fork transforme l’option native `groupStatus: true` en `groupStatusMessageV2`, ajoute `contextInfo.isGroupStatus`, la métadonnée stanza `is_group_status="true"` et le type média requis. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+Le bot conserve le socket et le fork `xzcbailz` existants. Pour chaque publication, le média est préparé et téléversé avant d’être enveloppé dans `groupStatusMessageV2`; le message interne reçoit `contextInfo.isGroupStatus = true` et `relayMessage()` ajoute la métadonnée stanza `is_group_status="true"`. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
 
 ---
 
