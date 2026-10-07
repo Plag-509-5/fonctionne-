@@ -11,6 +11,7 @@ const {
   genericCommandResponse,
   withCommandTheme,
   activateCommandTheme,
+  createMetaQuote,
   setupCommandThemeWrapper
 } = require('../services/oni-theme');
 
@@ -50,13 +51,77 @@ test('unifie automatiquement les réponses des commandes sans doubler un thème 
   });
 
   assert.equal(sent[0].content.text, 'hors commande');
+  assert.equal(sent[0].options.quoted, undefined);
   assert.equal(sent[1].content.text, 'thème désactivé');
+  assert.equal(sent[1].options.quoted.message.contactMessage.displayName, 'Meta AI', 'le thème classique utilise aussi Meta quoted');
   assert.match(sent[2].content.text, /𝗔 𝗟 𝗜 𝗩 𝗘\s+𝗥 𝗘 𝗦 𝗨 𝗟 𝗧/);
   assert.match(sent[2].content.text, /Le bot fonctionne\./);
+  assert.equal(sent[2].options.quoted.key.id, 'META_AI_ALIVE');
   assert.equal(sent[3].content.text.split(TOP_DIVIDER).length, 5, 'le thème ne doit pas être imbriqué');
   assert.equal(sent[4].content.text, 'Statut fourni par l’utilisateur');
+  assert.equal(sent[4].options.quoted, undefined, 'le contenu publié en statut ne doit jamais être habillé');
   assert.deepEqual(sent[5].content, { text: 'Contenu brut' });
+  assert.equal(sent[5].options.quoted.key.id, 'META_AI_ALIVE');
   assert.equal(sent[6].content.caption.length, 1000, 'une longue caption média doit rester intacte');
+  assert.equal(sent[6].options.quoted.message.contactMessage.displayName, 'Meta AI');
+});
+
+test('applique Meta quoted à toutes les réponses de commande sauf opérations techniques', async () => {
+  const sent = [];
+  const relayed = [];
+  const socket = {
+    async sendMessage(jid, content, options) {
+      sent.push({ jid, content, options });
+    },
+    async relayMessage(jid, message, options) {
+      relayed.push({ jid, message, options });
+    }
+  };
+  setupCommandThemeWrapper(socket);
+
+  await withCommandTheme(async () => {
+    activateCommandTheme('menu', false);
+    await socket.sendMessage('chat', { text: 'Menu' }, { quoted: { key: { id: 'ORIGINAL' } } });
+    await socket.sendMessage('chat', { react: { text: '✅', key: { id: '1' } } });
+    await socket.sendMessage('chat', { delete: { id: '1' } });
+    await socket.sendMessage('chat', { text: 'Interne', _skipMetaQuote: true });
+    await socket.sendMessage('120363@newsletter', { text: 'Chaîne' });
+    await socket.sendMessage('123@g.us', {
+      image: Buffer.from('statut'),
+      caption: 'Caption originale',
+      groupStatus: true
+    });
+    await socket.relayMessage('chat', {
+      viewOnceMessage: {
+        message: {
+          interactiveMessage: {
+            body: { text: 'Menu interactif' },
+            contextInfo: { mentionedJid: ['509@s.whatsapp.net'] }
+          }
+        }
+      }
+    }, { messageId: 'interactive-1' });
+    await socket.relayMessage('123@g.us', {
+      groupStatusMessageV2: { message: { conversation: 'Statut de groupe' } }
+    }, { messageId: 'status-1' });
+  });
+
+  assert.deepEqual(sent[0].options.quoted, createMetaQuote('menu'));
+  assert.equal(sent[1].options.quoted, undefined);
+  assert.equal(sent[2].options.quoted, undefined);
+  assert.deepEqual(sent[3].content, { text: 'Interne' });
+  assert.equal(sent[3].options.quoted, undefined);
+  assert.equal(sent[4].options.quoted, undefined);
+  assert.equal(sent[5].content.caption, 'Caption originale');
+  assert.equal(sent[5].content.groupStatus, true);
+  assert.equal(sent[5].options.quoted, undefined, 'un statut de groupe ne reçoit aucun habillage');
+  const relayContext = relayed[0].message.viewOnceMessage.message.interactiveMessage.contextInfo;
+  assert.equal(relayContext.stanzaId, 'META_AI_MENU');
+  assert.equal(relayContext.quotedMessage.contactMessage.displayName, 'Meta AI');
+  assert.deepEqual(relayContext.mentionedJid, ['509@s.whatsapp.net']);
+  assert.equal(relayed[0].options._skipMetaQuote, undefined);
+  assert.equal(relayed[1].message.groupStatusMessageV2.message.conversation, 'Statut de groupe');
+  assert.equal(relayed[1].message.groupStatusMessageV2.contextInfo, undefined);
 });
 
 test('isole le thème de deux commandes concurrentes avec AsyncLocalStorage', async () => {

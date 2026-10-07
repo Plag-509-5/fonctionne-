@@ -47,11 +47,18 @@ async function buildGroupStatusPayload({ quotedMessage, textInput = '', download
     if (!buffer.length) throw new Error('Le média cité est vide');
 
     if (downloadType === 'image') {
-      const caption = requestedText || String(media.caption || '').trim();
-      return { type: 'image', payload: { image: buffer, ...(caption ? { caption } : {}) } };
+      const caption = String(media.caption || '').trim() || requestedText;
+      return {
+        type: 'image',
+        payload: {
+          image: buffer,
+          mimetype: media.mimetype || 'image/jpeg',
+          ...(caption ? { caption } : {})
+        }
+      };
     }
     if (downloadType === 'video') {
-      const caption = requestedText || String(media.caption || '').trim();
+      const caption = String(media.caption || '').trim() || requestedText;
       return {
         type: 'video',
         payload: {

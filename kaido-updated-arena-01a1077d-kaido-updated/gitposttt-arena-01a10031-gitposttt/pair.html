@@ -178,6 +178,7 @@ body {
     <div class="subtitle">Connexion sans QR code via numéro de téléphone</div>
 
     <div class="label">Numéro WhatsApp (avec indicatif, sans +) :</div>
+    <div class="label" style="font-size:.82rem;color:#94a3b8;margin-top:-8px">Code personnalisé : <strong style="color:#38bdf8">KAIDOBOT</strong></div>
     <div class="input-container">
       <input type="tel" id="number" placeholder="5094744xxxx">
       <button id="submit"><i class="fa-solid fa-arrow-right"></i> Obtenir</button>
@@ -231,8 +232,15 @@ submitBtn.addEventListener("click", async (e) => {
   
   try {
     const { data } = await axios(`/code?number=${cleanNumber}`);
-    const code = data.code || data.pairingCode || "Indisponible";
-    
+    const code = data.code || data.pairingCode;
+    if (!code) {
+      const statusMessage = data.message || (data.status === 'reconnecting'
+        ? 'Session enregistrée : reconnexion en cours.'
+        : 'Cette session est déjà en cours de connexion.');
+      pairElement.textContent = statusMessage;
+      return;
+    }
+
     pairElement.innerHTML = `
       <div class="code-display" id="codeDisplay" data-code="${code}" onclick="copyCode()">
         CODE : <span style="color:#ffffff">${code}</span>

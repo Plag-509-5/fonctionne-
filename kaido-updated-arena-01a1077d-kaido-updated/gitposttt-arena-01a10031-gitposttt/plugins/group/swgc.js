@@ -12,6 +12,11 @@ const {
 } = require('../../services/group-status-selector');
 const { buildGroupStatusPayload } = require('../../services/group-status-content');
 
+function groupStatusConfirmation(type, subject) {
+  const label = type === 'text' ? 'texte' : type;
+  return `Statut ${label} posté sur : ${subject}`;
+}
+
 async function sendPrivate(socket, jid, content, options) {
   if (!jid || jid.endsWith('@g.us')) return null;
   try {
@@ -116,7 +121,7 @@ async function executeSwgc(context, dependencies = {}) {
     // Important : aucune réaction, confirmation ou texte n’est envoyé dans
     // le groupe. Le seul envoi vers le JID du groupe est groupStatusMessageV2.
     return sendPrivate(socket, privateJid, {
-      text: `✅ Statut ${built.type} publié dans « ${target.subject} ».\nAucun message n’a été envoyé dans la conversation du groupe.`
+      text: groupStatusConfirmation(built.type, target.subject)
     }, isGroupCommand ? undefined : { quoted: msg });
   } catch (error) {
     console.error('[SWGC ERROR]', error);
@@ -133,5 +138,5 @@ module.exports = {
   description: 'Choisit en privé un groupe puis y publie un statut sans message dans le chat',
   usage: '.swgc | .swgc <texte> | répondre à un média avec .swgc',
   execute: executeSwgc,
-  _test: { sendPrivate, ensureMembership, executeSwgc }
+  _test: { groupStatusConfirmation, sendPrivate, ensureMembership, executeSwgc }
 };

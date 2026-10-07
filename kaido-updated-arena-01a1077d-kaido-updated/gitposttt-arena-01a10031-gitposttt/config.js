@@ -12,6 +12,7 @@ module.exports = {
     MAX_RETRIES: 3,
     BOT_NAME: process.env.BOT_NAME || 'KAIDO-MD',
     BOT_VERSION: '2.0.0',
+    PAIRING_CODE: process.env.PAIRING_CODE || 'KAIDOBOT',
     OWNER_NAME: process.env.OWNER_NAME || 'Mugiwara no plag',
     OWNER_NUMBER: process.env.OWNER_NUMBER || '50947440869',
     BOT_FOOTER: process.env.BOT_FOOTER || '> 𝐏𝐎𝐖𝐄𝐑𝐄𝐃 𝐁𝐘 𝐏𝐋4𝐆 x *TECH MONDIAL* 👑',

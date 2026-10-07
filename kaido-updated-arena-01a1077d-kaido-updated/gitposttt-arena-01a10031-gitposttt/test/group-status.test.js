@@ -10,6 +10,8 @@ const {
   buildGroupStatusPayload
 } = require('../services/group-status-content');
 const swgc = require('../plugins/group/swgc');
+const { groupStatus, isGroupJid } = require('../status');
+const { generateWAMessageContent } = require('@whiskeysockets/baileys');
 
 function resetSelections() {
   selector._test.pendingSelections.clear();
@@ -125,7 +127,16 @@ test('construit des statuts propres sans watermark pour texte, image, vidéo et 
   });
   assert.equal(image.type, 'image');
   assert.equal(image.payload.image.toString(), 'img');
-  assert.equal(image.payload.caption, 'nouvelle légende');
+  assert.equal(image.payload.caption, 'originale');
+  assert.equal(image.payload.mimetype, 'image/jpeg');
+
+  const imageWithoutCaption = await buildGroupStatusPayload({
+    quotedMessage: { imageMessage: { bytes: 'img2', mimetype: 'image/png' } },
+    textInput: 'légende de commande',
+    downloadContent
+  });
+  assert.equal(imageWithoutCaption.payload.caption, 'légende de commande');
+  assert.equal(imageWithoutCaption.payload.mimetype, 'image/png');
 
   const video = await buildGroupStatusPayload({
     quotedMessage: { videoMessage: { bytes: 'vid', mimetype: 'video/mp4', caption: 'vidéo' } },
@@ -142,6 +153,116 @@ test('construit des statuts propres sans watermark pour texte, image, vidéo et 
   assert.equal(audio.payload.ptt, true);
   assert.doesNotMatch(JSON.stringify([text, image, video, audio]), /posted by|Kaido-MD/i);
   assert.equal(unwrapMessage({ ephemeralMessage: { message: { conversation: 'ok' } } }).conversation, 'ok');
+});
+
+test('utilise le chemin Baileys natif groupStatus sans modifier le média', async () => {
+  const calls = [];
+  const expected = { key: { id: 'GROUP_STATUS_1' } };
+  const socket = {
+    async sendMessage(jid, content, options) {
+      calls.push({ jid, content, options });
+      return expected;
+    }
+  };
+  const media = Buffer.from('image-réelle');
+  const payload = { image: media, mimetype: 'image/png', caption: 'caption originale' };
+
+  const result = await groupStatus(socket, '123456@g.us', payload);
+
+  assert.equal(result, expected);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].jid, '123456@g.us');
+  assert.equal(calls[0].content.image, media);
+  assert.equal(calls[0].content.caption, 'caption originale');
+  assert.equal(calls[0].content.mimetype, 'image/png');
+  assert.equal(calls[0].content.groupStatus, true);
+  assert.deepEqual(payload, { image: media, mimetype: 'image/png', caption: 'caption originale' });
+  assert.equal(isGroupJid('123456@g.us'), true);
+  assert.equal(isGroupJid('123456@s.whatsapp.net'), false);
+  await assert.rejects(groupStatus(socket, '123456@s.whatsapp.net', { text: 'non' }), /JID @g\.us/);
+});
+
+test('le fork génère image, vidéo et audio dans groupStatusMessageV2 avec isGroupStatus', async () => {
+  const uploads = [];
+  const options = {
+    jid: '123456@g.us',
+    logger: { debug() {}, info() {}, warn() {} },
+    async upload(encryptedPath, metadata) {
+      assert.equal(fs.existsSync(encryptedPath), true);
+      uploads.push(metadata.mediaType);
+      return {
+        mediaUrl: `https://upload.invalid/${metadata.mediaType}`,
+        directPath: `/group-status/${metadata.mediaType}`
+      };
+    }
+  };
+  const samples = [
+    ['image', {
+      image: Buffer.from('image-binaire'),
+      mimetype: 'image/png',
+      caption: 'image originale',
+      jpegThumbnail: Buffer.alloc(0)
+    }],
+    ['video', {
+      video: Buffer.from('video-binaire'),
+      mimetype: 'video/mp4',
+      caption: 'vidéo originale',
+      jpegThumbnail: Buffer.alloc(0),
+      seconds: 1
+    }],
+    ['audio', {
+      audio: Buffer.from('audio-binaire'),
+      mimetype: 'audio/ogg',
+      ptt: true,
+      seconds: 1,
+      waveform: Buffer.alloc(0)
+    }]
+  ];
+
+  for (const [type, payload] of samples) {
+    const generated = await generateWAMessageContent(
+      { ...payload, groupStatus: true },
+      options
+    );
+    const inner = generated.groupStatusMessageV2?.message?.[`${type}Message`];
+    assert.ok(inner, `${type} absent de groupStatusMessageV2`);
+    assert.equal(inner.contextInfo?.isGroupStatus, true);
+    assert.equal(inner.mimetype, payload.mimetype);
+    assert.ok(inner.fileLength, `${type} n’a pas été téléversé`);
+    if (payload.caption) assert.equal(inner.caption, payload.caption);
+  }
+
+  assert.deepEqual(uploads, ['image', 'video', 'audio']);
+
+  const text = await generateWAMessageContent({ text: 'Bonjour', groupStatus: true }, options);
+  assert.equal(text.groupStatusMessageV2?.message?.extendedTextMessage?.text, 'Bonjour');
+  assert.equal(
+    text.groupStatusMessageV2?.message?.extendedTextMessage?.contextInfo?.isGroupStatus,
+    true
+  );
+});
+
+test('la version Baileys épinglée ajoute la métadonnée stanza et détecte le média interne', () => {
+  const baileysEntry = require.resolve('@whiskeysockets/baileys');
+  const relaySource = fs.readFileSync(
+    path.join(path.dirname(baileysEntry), 'Socket', 'messages-send.js'),
+    'utf8'
+  );
+  assert.match(relaySource, /metaAttrs\.is_group_status\s*=\s*['"]true['"]/);
+  assert.match(
+    relaySource,
+    /const innerMessage = normalizeMessageContent\(message\);[\s\S]*getMediaType\(innerMessage\)/
+  );
+});
+
+test('les confirmations swgc restent concises pour chaque type', () => {
+  const labels = { image: 'image', video: 'video', audio: 'audio', text: 'texte' };
+  for (const [type, label] of Object.entries(labels)) {
+    assert.equal(
+      swgc._test.groupStatusConfirmation(type, 'Amis'),
+      `Statut ${label} posté sur : Amis`
+    );
+  }
 });
 
 test('workflow privé: liste, sélectionne puis publie sans sendMessage dans le groupe', async () => {
@@ -166,7 +287,7 @@ test('workflow privé: liste, sélectionne puis publie sans sendMessage dans le 
   assert.equal(published[0].payload.text, 'Salut le groupe');
   assert.equal(fixture.sent.filter(event => event.jid.endsWith('@g.us')).length, 0);
   assert.equal(fixture.sent.at(-1).jid, fixture.context.from);
-  assert.match(fixture.sent.at(-1).content.text, /Aucun message n’a été envoyé/);
+  assert.equal(fixture.sent.at(-1).content.text, 'Statut texte posté sur : Amis');
 });
 
 test('même depuis un groupe, swgc ne répond jamais dans la conversation du groupe', async () => {
@@ -196,7 +317,13 @@ test('le handler intercepte la réponse numérique et l’ancien case swgc bruya
   const pluginSource = fs.readFileSync(path.join(__dirname, '..', 'plugins/group/swgc.js'), 'utf8');
   assert.doesNotMatch(pluginSource, /sendMessage\(target\.jid|sendMessage\(from/);
   const statusSource = fs.readFileSync(path.join(__dirname, '..', 'status.js'), 'utf8');
-  assert.match(statusSource, /groupStatusMessageV2/);
-  assert.match(statusSource, /relayMessage\(jid/);
-  assert.doesNotMatch(statusSource, /sendMessage\(/);
+  assert.match(statusSource, /groupStatus:\s*true/);
+  assert.match(statusSource, /socket\.sendMessage\(jid/);
+  assert.doesNotMatch(statusSource, /socket\.relayMessage\(/);
+
+  const packageJson = require('../package.json');
+  assert.equal(
+    packageJson.dependencies['@whiskeysockets/baileys'],
+    'npm:@itsliaaa/baileys@0.3.18-final'
+  );
 });

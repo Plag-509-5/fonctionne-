@@ -1,33 +1,36 @@
 // status.js
-const { generateWAMessageContent, generateWAMessageFromContent } = require("@whiskeysockets/baileys");
-const crypto = require("crypto");
 
+function isGroupJid(jid) {
+  return typeof jid === "string" && jid.endsWith("@g.us");
+}
+
+/**
+ * Publie un vrai statut rattaché au groupe.
+ *
+ * @itsliaaa/baileys transforme `groupStatus: true` en :
+ * - groupStatusMessageV2 ;
+ * - contextInfo.isGroupStatus = true sur le contenu interne ;
+ * - un nœud stanza <meta is_group_status="true"/> ;
+ * - le bon attribut `mediatype` pour les images, vidéos et audios.
+ *
+ * Le chemin natif sendMessage() évite les enveloppes relayées à la main qui
+ * pouvaient être acceptées par le serveur sans rendre leur média visible.
+ */
 async function groupStatus(socket, jid, content) {
-  const { backgroundColor, ...payload } = content || {};
+  if (!socket || typeof socket.sendMessage !== "function") {
+    throw new Error("Socket WhatsApp invalide.");
+  }
+  if (!isGroupJid(jid)) {
+    throw new Error("Le statut de groupe exige un JID @g.us.");
+  }
+  if (!content || typeof content !== "object") {
+    throw new Error("Contenu de statut invalide.");
+  }
 
-  const inside = await generateWAMessageContent(payload, {
-    upload: socket.waUploadToServer,
-    backgroundColor
+  return socket.sendMessage(jid, {
+    ...content,
+    groupStatus: true
   });
-
-  const messageSecret = crypto.randomBytes(32);
-
-  const m = generateWAMessageFromContent(
-    jid,
-    {
-      messageContextInfo: { messageSecret },
-      groupStatusMessageV2: {
-        message: {
-          ...inside,
-          messageContextInfo: { messageSecret }
-        }
-      }
-    },
-    {}
-  );
-
-  await socket.relayMessage(jid, m.message, { messageId: m.key.id });
-  return m;
 }
 
 async function buildStatusContent(m, socket, prefix, command) {
@@ -52,4 +55,4 @@ async function buildStatusContent(m, socket, prefix, command) {
   }
 }
 
-module.exports = { groupStatus, buildStatusContent };
+module.exports = { groupStatus, buildStatusContent, isGroupJid };
