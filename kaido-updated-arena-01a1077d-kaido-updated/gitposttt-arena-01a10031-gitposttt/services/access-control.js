@@ -85,7 +85,7 @@ function candidatesContain(candidates, value) {
   );
 }
 
-function resolveAccess({ identifiers, ownerValue, adminEntries = [], sessionNumber }) {
+function resolveAccess({ identifiers, ownerValue, adminEntries = [], sudoEntries = [], sessionNumber }) {
   const candidates = identifiers instanceof Set
     ? identifiers
     : addIdentifierCandidates(new Set(), identifiers);
@@ -95,13 +95,15 @@ function resolveAccess({ identifiers, ownerValue, adminEntries = [], sessionNumb
   const isConfiguredOwner = owners.some(number => candidates.has(number) || candidates.has(`${number}@s.whatsapp.net`));
   const isSessionOwner = Boolean(session && (candidates.has(session) || candidates.has(`${session}@s.whatsapp.net`)));
   const isMongoAdmin = adminEntries.some(entry => candidatesContain(candidates, entry));
+  const isSudo = sudoEntries.some(entry => candidatesContain(candidates, entry));
 
   return {
     isOwner: isConfiguredOwner || isSessionOwner,
     isConfiguredOwner,
     isSessionOwner,
     isMongoAdmin,
-    isPrivileged: isConfiguredOwner || isSessionOwner || isMongoAdmin,
+    isSudo,
+    isPrivileged: isConfiguredOwner || isSessionOwner || isMongoAdmin || isSudo,
     candidates
   };
 }

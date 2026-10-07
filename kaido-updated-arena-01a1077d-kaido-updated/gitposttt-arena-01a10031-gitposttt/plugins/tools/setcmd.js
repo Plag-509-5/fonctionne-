@@ -9,8 +9,7 @@ const {
   isEmoji,
   setReactionCommand,
   deleteReactionCommand,
-  getAllReactionCommands,
-  findReactionCommand
+  getAllReactionCommands
 } = require('../../files/reaction_cmd');
 
 module.exports = {
@@ -19,7 +18,7 @@ module.exports = {
   category: 'tools',
   description: 'Associe un sticker OU une réaction emoji à une commande (ex: .setcmd save, ✅ ou en répondant à un sticker)',
   usage: '.setcmd <commande>, <emoji> | .setcmd <commande> (en répondant à un sticker) | .delcmd | .listcmd',
-  async execute({ socket, msg, from, sender, senderNumber, args, command, prefix, quotedMsg }) {
+  async execute({ socket, msg, from, sender, senderNumber, sessionNumber, args, command, prefix, quotedMsg }) {
     const quoted = quotedMsg 
       || msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
       || msg.message?.stickerMessage?.contextInfo?.quotedMessage;
@@ -32,8 +31,8 @@ module.exports = {
 
     // ── 1. COMMANDE DE LISTING (.listcmd / .cmdlist) ──
     if (command === 'listcmd' || command === 'cmdlist') {
-      const stickerList = getAllStickerCommands();
-      const reactList = getAllReactionCommands();
+      const stickerList = getAllStickerCommands(sessionNumber);
+      const reactList = getAllReactionCommands(sessionNumber);
 
       if (!stickerList.length && !reactList.length) {
         return await socket.sendMessage(from, {
@@ -68,7 +67,7 @@ module.exports = {
       if (stickerMsg) {
         const hash = getPrimaryStickerHash(stickerMsg);
         if (hash) {
-          const deleted = await deleteStickerCommand(hash);
+          const deleted = await deleteStickerCommand(hash, sessionNumber);
           if (deleted) {
             return await socket.sendMessage(from, { text: '🗑️ *Sticker commande supprimé avec succès !*' }, { quoted: msg });
           }
@@ -87,10 +86,10 @@ module.exports = {
       let deletedSticker = false;
 
       if (isEmoji(target)) {
-        deletedEmoji = await deleteReactionCommand(target);
+        deletedEmoji = await deleteReactionCommand(target, sessionNumber);
       } else {
-        deletedEmoji = await deleteReactionCommand(target);
-        deletedSticker = await deleteStickerCommand(target);
+        deletedEmoji = await deleteReactionCommand(target, sessionNumber);
+        deletedSticker = await deleteStickerCommand(target, sessionNumber);
       }
 
       if (deletedEmoji || deletedSticker) {
@@ -120,7 +119,7 @@ module.exports = {
         return await socket.sendMessage(from, { text: '❌ Impossible d\'extraire l\'identifiant de ce sticker.' }, { quoted: msg });
       }
 
-      await setStickerCommand(hash, targetCmd, senderNumber, from);
+      await setStickerCommand(hash, targetCmd, senderNumber, sessionNumber);
 
       return await socket.sendMessage(from, {
         text: `╭───「 🎨 *STICKER COMMANDE ACTIVÉ* 」───
@@ -160,7 +159,7 @@ module.exports = {
 
     if (targetEmoji && targetCommand) {
       targetCommand = targetCommand.replace(/^[./!#]/, '').trim();
-      await setReactionCommand(targetEmoji, targetCommand, senderNumber, from);
+      await setReactionCommand(targetEmoji, targetCommand, senderNumber, sessionNumber);
 
       return await socket.sendMessage(from, {
         text: `╭───「 ✨ *RÉACTION COMMANDE ACTIVÉE* 」───

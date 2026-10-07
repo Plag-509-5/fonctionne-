@@ -57,3 +57,21 @@ test('le numéro de la session est reconnu comme propriétaire de sa propre sess
   assert.equal(access.isSessionOwner, true);
   assert.equal(access.isOwner, true);
 });
+
+test('un sudo est privilégié uniquement lorsqu’il figure dans la configuration de cette session', () => {
+  const identifiers = collectMessageIdentifiers({ key: { participant: '50988888888@s.whatsapp.net' } });
+  const allowed = resolveAccess({
+    identifiers,
+    sudoEntries: ['50988888888'],
+    sessionNumber: '50911111111'
+  });
+  const denied = resolveAccess({
+    identifiers,
+    sudoEntries: ['50999999999'],
+    sessionNumber: '50922222222'
+  });
+  assert.equal(allowed.isSudo, true);
+  assert.equal(allowed.isPrivileged, true);
+  assert.equal(denied.isSudo, false);
+  assert.equal(denied.isPrivileged, false);
+});

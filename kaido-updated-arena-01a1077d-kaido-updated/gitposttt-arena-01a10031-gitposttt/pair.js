@@ -53,6 +53,7 @@ const {
 const {
   withCommandTheme,
   activateCommandTheme,
+  isOniThemeEnabled,
   setupCommandThemeWrapper
 } = require('./services/oni-theme');
 loadPlugins();
@@ -121,7 +122,9 @@ const DEFAULT_SESSION_CONFIG = {
   PREFIX: '.',
   AUTO_ONLINE: false,
   ANTI_TAG_MODE: true,
-  MODE: 'public'
+  MODE: 'public',
+  THEME: 'onigashima',
+  SUDO_USERS: []
 };
 
 // En mode prefixless, seuls les noms réellement connus doivent réveiller le bot.
@@ -1397,7 +1400,8 @@ function setupCommandHandlers(socket, number) {
     const reactionMsg = (type === 'reactionMessage') ? msg.message.reactionMessage : msg.message?.reactionMessage;
     if (reactionMsg && reactionMsg.text) {
       const emojiReact = reactionMsg.text;
-      const matchedReactCmd = findReactionCommand(emojiReact);
+      const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+      const matchedReactCmd = findReactionCommand(emojiReact, sanitizedBot);
       if (matchedReactCmd && matchedReactCmd.command) {
         const targetKey = reactionMsg.key;
         const targetMsgId = targetKey?.id;
@@ -1410,13 +1414,13 @@ function setupCommandHandlers(socket, number) {
         const reactorNumber = (reactorJid || '').split('@')[0].split(':')[0];
 
         // Vérifier le mode privé et les droits avec la même source que les commandes texte.
-        const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
         const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
         const reactorIdentifiers = collectMessageIdentifiers(msg, reactorJid, reactorNumber);
         const reactorAccess = resolveAccess({
           identifiers: reactorIdentifiers,
           ownerValue: config.OWNER_NUMBER,
           adminEntries: await loadAdminsFromMongo(),
+          sudoEntries: sessionCfg.SUDO_USERS || [],
           sessionNumber: sanitizedBot
         });
         const isReactorOwner = reactorAccess.isConfiguredOwner;
@@ -1430,7 +1434,7 @@ function setupCommandHandlers(socket, number) {
         const fullBody = `${cmdPrefix}${fullCmdStr}`;
         const cmdName = fullCmdStr.split(' ')[0].toLowerCase();
         const cmdArgs = fullCmdStr.split(' ').slice(1);
-        activateCommandTheme(cmdName);
+        activateCommandTheme(cmdName, isOniThemeEnabled(sessionCfg.THEME));
 
         const quotedPayload = targetMsg?.message || null;
         const quotedParticipant = targetMsg?.key?.participant || targetKey?.participant || targetKey?.remoteJid;
@@ -1475,6 +1479,7 @@ function setupCommandHandlers(socket, number) {
           isOwner: isReactorOwner,
           isSessionOwner: reactorAccess.isSessionOwner,
           isMongoAdmin: reactorAccess.isMongoAdmin,
+          isSudo: reactorAccess.isSudo,
           isPrivileged: reactorAccess.isPrivileged,
           access: reactorAccess,
           config,
@@ -1520,7 +1525,8 @@ function setupCommandHandlers(socket, number) {
     // Détection de Sticker Command (Sticker associé à une commande)
     const stickerMsgObj = (type === 'stickerMessage') ? msg.message.stickerMessage : msg.message?.stickerMessage;
     if (stickerMsgObj) {
-      const matchedCmd = findStickerCommand(stickerMsgObj);
+      const stickerSessionId = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+      const matchedCmd = findStickerCommand(stickerMsgObj, stickerSessionId);
       if (matchedCmd && matchedCmd.command) {
         const stickerCfg = await loadSessionConfigMerged(number || socket.user?.id);
         const cmdPrefix = resolveSessionPrefix(stickerCfg, config.PREFIX || '.');
@@ -1675,7 +1681,7 @@ function setupCommandHandlers(socket, number) {
     const { command, args } = parsedCommand;
     // Toutes les réponses textuelles produites dans ce contexte adoptent le
     // thème Onigashima. AsyncLocalStorage isole les commandes concurrentes.
-    activateCommandTheme(command);
+    activateCommandTheme(command, isOniThemeEnabled(cfg.THEME));
 
     // 5. Récupérer les informations d'expéditeur
     const from = remoteJid;
@@ -1711,10 +1717,11 @@ function setupCommandHandlers(socket, number) {
       identifiers: senderIdentifiers,
       ownerValue: config.OWNER_NUMBER,
       adminEntries: mongoAdmins,
+      sudoEntries: sessionCfg.SUDO_USERS || [],
       sessionNumber: sanitizedBot
     });
     const isOwner = access.isConfiguredOwner;
-    const { isSessionOwner, isMongoAdmin, isPrivileged } = access;
+    const { isSessionOwner, isMongoAdmin, isSudo, isPrivileged } = access;
 
     // En mode privé, les propriétaires et admins Mongo restent autorisés.
     if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged) {
@@ -1772,6 +1779,7 @@ function setupCommandHandlers(socket, number) {
         isOwner,
         isSessionOwner,
         isMongoAdmin,
+        isSudo,
         isPrivileged,
         access,
         config,
@@ -7032,10 +7040,7 @@ case 'deletemenumber': {
 
 
 case 'cfn': {
-  const fs = require('fs');
-
   const botName = sessionCfg.botName || BOT_NAME_FANCY;
-  const logo = sessionCfg.logo || config.RCD_IMAGE_PATH;
 
   // Récupérer les arguments après la commande
   const full = args.join(" ").trim();
@@ -7080,30 +7085,40 @@ case 'cfn': {
 
   try {
     await addNewsletterToMongo(jid, emojis);
-    const syncResults = await syncNewsletterSockets(activeSockets, jid, 'follow', [socket]);
+
+    // Suivre d'abord avec la session qui a reçu la commande. Les autres
+    // sessions sont synchronisées ensuite, mais une session hors ligne ne doit
+    // plus transformer une sauvegarde réussie en faux échec global.
+    const currentResults = await syncNewsletterSockets(new Map(), jid, 'follow', [socket]);
+    const otherSockets = new Map(
+      [...activeSockets.entries()].filter(([, activeSocket]) => activeSocket && activeSocket !== socket)
+    );
+    const otherResults = await syncNewsletterSockets(otherSockets, jid, 'follow');
+    const syncResults = [...currentResults, ...otherResults];
 
     const emojiText = emojis.length ? emojis.join(' ') : `(défaut : ${DEFAULT_NEWSLETTER_EMOJIS.join(' ')})`;
-    const syncedSessions = syncResults.filter(result => result.ok).length;
+    const syncedSessions = new Set(syncResults.filter(result => result.ok).map(result => result.session)).size;
+    const currentFollowed = currentResults.some(result => result.ok);
+    const warning = currentFollowed
+      ? ''
+      : `\n⚠️ Sauvegarde effectuée, mais le suivi immédiat a échoué : ${currentResults[0]?.error || 'API newsletter indisponible'}`;
+    const mention = nowsender ? [nowsender] : [];
 
-    const metaQuote = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CFN" },
-      message: { contactMessage: { displayName: botName, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
-
-    let imagePayload = String(logo).startsWith('http') ? { url: logo } : fs.readFileSync(logo);
-
-    await socket.sendMessage(sender, {
-      image: imagePayload,
-      caption: `✅ Chaîne suivie et sauvegardée !\n\nJID: ${jid}\nEmojis: ${emojiText}\nSessions synchronisées: ${syncedSessions}\nAjouté par: @${senderIdSimple}`,
-      footer: `📌 ${botName} FOLLOW CHANNEL`,
-      mentions: [nowsender],
-      buttons: [{ buttonId: `${prefix}menu`, buttonText: { displayText: "📋 MENU" }, type: 1 }],
-      headerType: 4
-    }, { quoted: metaQuote });
+    // Une réponse texte standard évite le crash Baileys provoqué par certains
+    // anciens payloads image/boutons dont un JID interne était undefined.
+    await socket.sendMessage(from, {
+      text: `✅ *Chaîne sauvegardée !*\n\n` +
+        `JID : ${jid}\n` +
+        `Emojis : ${emojiText}\n` +
+        `Sessions synchronisées : ${syncedSessions}\n` +
+        `Ajouté par : @${senderIdSimple}\n` +
+        `Bot : ${botName}${warning}`,
+      mentions: mention
+    }, { quoted: msg });
 
   } catch (e) {
     console.error('cfn error', e);
-    await socket.sendMessage(sender, { text: `❌ Échec de l’ajout/suivi de la chaîne : ${e.message || e}` }, { quoted: msg });
+    await socket.sendMessage(from, { text: `❌ Échec de l’ajout/suivi de la chaîne : ${e.message || e}` }, { quoted: msg });
   }
   break;
 }

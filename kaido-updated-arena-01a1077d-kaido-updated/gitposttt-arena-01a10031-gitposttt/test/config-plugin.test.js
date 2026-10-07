@@ -91,3 +91,12 @@ test('un propriétaire de session résolu depuis une identité LID peut modifier
   await plugin.execute(fixture.context);
   assert.equal(fixture.saved[0].config.PREFIX, '#');
 });
+
+test('un sudo de la session peut modifier sa configuration', async () => {
+  const fixture = createContext(['setprefix', '!'], {
+    senderNumber: '50922222222',
+    isSudo: true
+  });
+  await plugin.execute(fixture.context);
+  assert.equal(fixture.saved[0].config.PREFIX, '!');
+});

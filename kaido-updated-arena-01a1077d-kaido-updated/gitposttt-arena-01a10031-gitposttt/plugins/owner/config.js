@@ -7,14 +7,14 @@ function cleanNumber(value) {
   return String(value || '').replace(/[^0-9]/g, '');
 }
 
-function canManageConfig({ senderNumber, sessionNumber, config, isOwner, isSessionOwner, isMongoAdmin }) {
+function canManageConfig({ senderNumber, sessionNumber, config, isOwner, isSessionOwner, isMongoAdmin, isSudo }) {
   const sender = cleanNumber(senderNumber);
   const session = cleanNumber(sessionNumber);
   const owners = String(config?.OWNER_NUMBER || '')
     .split(/[,;|]+/)
     .map(cleanNumber)
     .filter(Boolean);
-  return Boolean(isOwner || isSessionOwner || isMongoAdmin || (sender && (sender === session || owners.includes(sender))));
+  return Boolean(isOwner || isSessionOwner || isMongoAdmin || isSudo || (sender && (sender === session || owners.includes(sender))));
 }
 
 async function send(socket, from, msg, text) {
@@ -120,7 +120,9 @@ module.exports = {
         `• AUTO_LIKE_STATUS : ${configEnabled(next.AUTO_LIKE_STATUS, true) ? 'ON' : 'OFF'}`,
         `• AUTO_RECORDING : ${configEnabled(next.AUTO_RECORDING, false) ? 'ON' : 'OFF'}`,
         `• PREFIX : ${formatPrefix(currentPrefix)}`,
-        `• MODE : ${next.MODE || 'public'}`
+        `• MODE : ${next.MODE || 'public'}`,
+        `• THEME : ${next.THEME || 'onigashima'}`,
+        `• SUDO_USERS : ${Array.isArray(next.SUDO_USERS) ? next.SUDO_USERS.length : 0}`
       ].join('\n'));
     }
 

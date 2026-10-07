@@ -36,6 +36,10 @@ test('unifie automatiquement les réponses des commandes sans doubler un thème 
 
   await socket.sendMessage('chat', { text: 'hors commande' });
   await withCommandTheme(async () => {
+    activateCommandTheme('classic', false);
+    await socket.sendMessage('chat', { text: 'thème désactivé' });
+  });
+  await withCommandTheme(async () => {
     activateCommandTheme('alive');
     await socket.sendMessage('chat', { text: 'Le bot fonctionne.' });
     const themed = genericCommandResponse('alive', 'Déjà stylé');
@@ -46,12 +50,13 @@ test('unifie automatiquement les réponses des commandes sans doubler un thème 
   });
 
   assert.equal(sent[0].content.text, 'hors commande');
-  assert.match(sent[1].content.text, /𝗔 𝗟 𝗜 𝗩 𝗘\s+𝗥 𝗘 𝗦 𝗨 𝗟 𝗧/);
-  assert.match(sent[1].content.text, /Le bot fonctionne\./);
-  assert.equal(sent[2].content.text.split(TOP_DIVIDER).length, 5, 'le thème ne doit pas être imbriqué');
-  assert.equal(sent[3].content.text, 'Statut fourni par l’utilisateur');
-  assert.deepEqual(sent[4].content, { text: 'Contenu brut' });
-  assert.equal(sent[5].content.caption.length, 1000, 'une longue caption média doit rester intacte');
+  assert.equal(sent[1].content.text, 'thème désactivé');
+  assert.match(sent[2].content.text, /𝗔 𝗟 𝗜 𝗩 𝗘\s+𝗥 𝗘 𝗦 𝗨 𝗟 𝗧/);
+  assert.match(sent[2].content.text, /Le bot fonctionne\./);
+  assert.equal(sent[3].content.text.split(TOP_DIVIDER).length, 5, 'le thème ne doit pas être imbriqué');
+  assert.equal(sent[4].content.text, 'Statut fourni par l’utilisateur');
+  assert.deepEqual(sent[5].content, { text: 'Contenu brut' });
+  assert.equal(sent[6].content.caption.length, 1000, 'une longue caption média doit rester intacte');
 });
 
 test('isole le thème de deux commandes concurrentes avec AsyncLocalStorage', async () => {

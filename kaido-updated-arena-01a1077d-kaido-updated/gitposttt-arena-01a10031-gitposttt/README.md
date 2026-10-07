@@ -9,7 +9,8 @@
 - **⚡ Multi-Sessions & Multi-Device :** Connexion de plusieurs numéros WhatsApp simultanément via code de pairing sans scan QR.
 - **🔄 Reconnexion Automatique :** Gestion intelligente des déconnexions réseau temporaires sans perte de session.
 - **🔥 Hot-Reload Automatique :** Dès que vous ajoutez, modifiez ou supprimez un fichier dans `plugins/`, il est rechargé instantanément en mémoire sans redémarrer le bot ni taper de commande !
-- **⛩ Thème Onigashima :** Le menu est construit depuis les commandes et alias réellement chargés; les réponses textuelles de toutes les commandes utilisent automatiquement la même identité visuelle, y compris les commandes historiques.
+- **⛩ Thèmes par session :** `.changetheme 1` restaure le style classique et `.changetheme 2` active Onigashima; le choix est conservé dans MongoDB après redémarrage.
+- **🛡️ Sudo par session :** `.sudo <numéro>`, `.delsudo <numéro>` et `.listsudo` délèguent les commandes privilégiées sans affecter les autres sessions.
 - **🌐 Tableau de Bord Web Complet :**
   - Gestion des sessions actives et archivées (`/dashboard/sessions.html`).
   - Gestion des newsletters WhatsApp et auto-réactions (`/dashboard/newsletters.html`).
@@ -28,7 +29,7 @@
 - **🧠 Intelligence Artificielle :** Assistant IA conversationnel intégré (`.ai`, `.gpt`).
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
-  - **Sticker to Command (.setcmd) :** Associez n'importe quel sticker WhatsApp comme raccourci/alias d'une commande (ex: `.setcmd ping`, `.setcmd save`, `.setcmd menu`).
+  - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
@@ -145,13 +146,22 @@ Chaque session peut être configurée directement dans WhatsApp par le propriét
 .config alwaysonline off
 .config setprefix !
 .config setprefix off
+.mode public
+.mode private
+.changetheme 1
+.changetheme 2
+.sudo 509XXXXXXXX
+.delsudo 509XXXXXXXX
 ```
 
 - `alwaysonline on` garde la présence du compte disponible.
 - `alwaysonline off` applique la présence `unavailable`. Un message ordinaire est ignoré sans appel à `readMessages`; une commande reconnue est marquée comme lue, réveille temporairement le bot, puis celui-ci repasse hors ligne.
 - `setprefix off` enregistre un préfixe vide. Dans ce mode, le bot examine uniquement le premier mot : `menu` est exécuté, tandis que `bonjour menu` ou un mot inconnu sont ignorés silencieusement.
 - Pour réactiver le point depuis le mode sans préfixe : `config setprefix .`.
-- `.config show` affiche les valeurs actives de la session.
+- `.mode public|private` est enregistré par numéro de session et restauré après redémarrage.
+- `.changetheme 1` utilise les réponses classiques; `.changetheme 2` applique Onigashima. Le menu et `.ping` suivent immédiatement le choix de chaque session.
+- `.sudo`, `.delsudo` et `.listsudo` gèrent une liste persistante d’opérateurs propre à chaque session.
+- `.config show` affiche les valeurs actives de la session, y compris le mode, le thème et le nombre de sudo.
 
 > **Limite WhatsApp :** un seul coche signifie que le message n’a pas encore été livré au compte/appareil connecté. Le bot doit recevoir le message pour savoir si son premier mot est une commande; il ne peut donc pas garantir un seul coche tout en effectuant cette détection. En mode OFF, il évite l’accusé de **lecture** des textes ordinaires, mais WhatsApp peut tout de même afficher deux coches grises de livraison. Les coches bleues dépendent aussi des réglages de confidentialité WhatsApp.
 

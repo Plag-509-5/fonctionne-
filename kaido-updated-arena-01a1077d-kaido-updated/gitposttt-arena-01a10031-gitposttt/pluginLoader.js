@@ -152,6 +152,10 @@ function getAllPluginsList() {
   return Array.from(uniquePlugins.values());
 }
 
+function hasOwnerCommandAccess(context = {}) {
+  return Boolean(context.isOwner || context.isSessionOwner || context.isSudo);
+}
+
 /**
  * Helper to execute a plugin with permission checks
  */
@@ -160,11 +164,15 @@ async function executePlugin(commandName, context) {
   const plugin = pluginsMap.get(cmd);
   if (!plugin) return false;
 
-  const { socket, msg, from, sender, isOwner } = context;
+  const { socket, msg, from, sender, isOwner, isSessionOwner, isSudo } = context;
+
+  // Un sudo est un opérateur délégué uniquement pour sa session. Les admins
+  // Mongo ne deviennent pas implicitement propriétaires de toutes les commandes.
+  const ownerCommandAccess = hasOwnerCommandAccess({ isOwner, isSessionOwner, isSudo });
 
   // 1. Check Owner Only
-  if (plugin.isOwner && !isOwner) {
-    await socket.sendMessage(from, { text: '⛔ *Cette commande est réservée au propriétaire du bot.*' }, { quoted: msg });
+  if (plugin.isOwner && !ownerCommandAccess) {
+    await socket.sendMessage(from, { text: '⛔ *Cette commande est réservée au propriétaire ou à un sudo de cette session.*' }, { quoted: msg });
     return true;
   }
 
@@ -188,7 +196,7 @@ async function executePlugin(commandName, context) {
         const isUserAdmin = participants.some(p => p.id === senderJid && (p.admin === 'admin' || p.admin === 'superadmin'));
         const isBotAdmin = botJid ? participants.some(p => p.id === botJid && (p.admin === 'admin' || p.admin === 'superadmin')) : false;
 
-        if (plugin.isAdmin && !isUserAdmin && !isOwner) {
+        if (plugin.isAdmin && !isUserAdmin && !ownerCommandAccess) {
           await socket.sendMessage(from, { text: '❌ *Seuls les administrateurs du groupe peuvent exécuter cette commande.*' }, { quoted: msg });
           return true;
         }
@@ -244,5 +252,6 @@ module.exports = {
   getPlugins: () => pluginsMap,
   getAllPluginsList,
   getPluginsByCategory,
-  executePlugin
+  executePlugin,
+  _test: { hasOwnerCommandAccess }
 };

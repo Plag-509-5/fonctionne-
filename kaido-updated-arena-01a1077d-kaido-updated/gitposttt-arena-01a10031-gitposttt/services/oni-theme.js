@@ -71,15 +71,24 @@ function genericCommandResponse(command, text) {
   return `${oniHeader(title)}\n\n${sectionHeader('RESPONSE', '⛩')}\n\n${String(text).trim()}\n\n${oniFooter()}`;
 }
 
+function normaliseTheme(value) {
+  const theme = String(value ?? 'onigashima').trim().toLowerCase();
+  return ['none', 'off', 'classic', '1'].includes(theme) ? 'none' : 'onigashima';
+}
+
+function isOniThemeEnabled(value) {
+  return normaliseTheme(value) === 'onigashima';
+}
+
 function withCommandTheme(callback) {
   return THEME_CONTEXT.run({ enabled: false, command: '' }, callback);
 }
 
-function activateCommandTheme(command) {
+function activateCommandTheme(command, enabled = true) {
   const state = THEME_CONTEXT.getStore();
   if (!state) return;
   state.command = String(command || 'kaido').toLowerCase();
-  state.enabled = true;
+  state.enabled = Boolean(enabled);
 }
 
 function styleContentForCurrentCommand(content, jid = '') {
@@ -134,6 +143,8 @@ module.exports = {
   oniFooter,
   isOniThemed,
   genericCommandResponse,
+  normaliseTheme,
+  isOniThemeEnabled,
   withCommandTheme,
   activateCommandTheme,
   styleContentForCurrentCommand,

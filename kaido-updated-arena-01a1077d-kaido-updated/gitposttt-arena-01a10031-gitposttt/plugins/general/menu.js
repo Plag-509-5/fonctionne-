@@ -1,12 +1,12 @@
 'use strict';
 
-const moment = require('moment-timezone');
 const {
   TOP_DIVIDER,
   bold,
   italic,
   commandText,
-  sectionHeader
+  sectionHeader,
+  isOniThemeEnabled
 } = require('../../services/oni-theme');
 
 const SECTION_META = {
@@ -138,6 +138,55 @@ function buildCommandSections(categories = {}, legacyCommands = [], prefix = '.'
   };
 }
 
+function buildClassicMenuText({ botName, ownerName, userName, prefix, mode, uptime, categories, legacyCommands }) {
+  const groups = Object.fromEntries(Object.keys(SECTION_META).map(key => [key, []]));
+  const registered = new Set();
+
+  for (const [pluginCategory, plugins] of Object.entries(categories || {})) {
+    const section = pluginCategoryToSection(pluginCategory);
+    for (const plugin of plugins || []) {
+      const names = [...new Set([plugin.name, ...(plugin.aliases || [])]
+        .filter(Boolean)
+        .map(name => String(name).toLowerCase()))];
+      names.forEach(name => registered.add(name));
+      if (names.length) {
+        groups[section]?.push(`${prefix}${names[0]}${names.length > 1 ? ` (${names.slice(1).map(name => `${prefix}${name}`).join(', ')})` : ''}`);
+      }
+    }
+  }
+
+  for (const value of legacyCommands || []) {
+    const name = String(value || '').trim().toLowerCase();
+    if (!name || registered.has(name)) continue;
+    registered.add(name);
+    groups[classifyLegacy(name)].push(`${prefix}${name}`);
+  }
+
+  const lines = [
+    `╔══════════════════════╗`,
+    `║     🐉 ${botName} 🐉`,
+    `╚══════════════════════╝`,
+    '',
+    `👤 Utilisateur : ${userName}`,
+    `👑 Créateur : ${ownerName}`,
+    `⚙️ Mode : ${String(mode || 'public').toUpperCase()}`,
+    `⏱️ Uptime : ${uptime}`,
+    `📌 Préfixe : ${prefix || 'aucun (prefixless)'}`,
+    `📊 Commandes et alias : ${registered.size}`,
+    ''
+  ];
+
+  for (const [key, commands] of Object.entries(groups)
+    .filter(([, entries]) => entries.length)
+    .sort(([left], [right]) => SECTION_META[left].order - SECTION_META[right].order)) {
+    lines.push(`┌───「 ${SECTION_META[key].icon} ${SECTION_META[key].title} 」`);
+    commands.sort().forEach(command => lines.push(`│ • ${command}`));
+    lines.push('└───', '');
+  }
+  lines.push('> POWERED BY PLAG TECH');
+  return lines.join('\n');
+}
+
 function buildMenuText({ botName, ownerName, userName, prefix, mode, uptime, year, categories, legacyCommands }) {
   const prefixLabel = prefix ? `[ ${prefix} ]` : '[ PREFIXLESS ]';
   const commandSections = buildCommandSections(categories, legacyCommands, prefix);
@@ -192,18 +241,24 @@ module.exports = {
     legacyCommands,
     getPluginsByCategory
   }) {
-    const now = moment().tz('America/Port-au-Prince');
-    const menuText = buildMenuText({
+    const year = new Intl.DateTimeFormat('en', {
+      timeZone: 'America/Port-au-Prince',
+      year: 'numeric'
+    }).format(new Date());
+    const menuData = {
       botName: sessionCfg?.botName || config?.BOT_NAME || 'KAIDO MD',
       ownerName: cleanDisplayName(config?.OWNER_NAME, 'PLAG'),
       userName: cleanDisplayName(pushName, `@${senderNumber}`),
       prefix,
       mode: sessionCfg?.MODE || 'public',
       uptime: formatUptime(process.uptime()),
-      year: now.format('YYYY'),
+      year,
       categories: getPluginsByCategory ? getPluginsByCategory() : {},
       legacyCommands: Array.isArray(legacyCommands) ? legacyCommands : []
-    });
+    };
+    const menuText = isOniThemeEnabled(sessionCfg?.THEME)
+      ? buildMenuText(menuData)
+      : buildClassicMenuText(menuData);
 
     await socket.sendMessage(from, {
       text: menuText,
@@ -215,6 +270,7 @@ module.exports = {
     commandWithPrefix,
     pluginLine,
     buildCommandSections,
+    buildClassicMenuText,
     buildMenuText,
     formatUptime
   }

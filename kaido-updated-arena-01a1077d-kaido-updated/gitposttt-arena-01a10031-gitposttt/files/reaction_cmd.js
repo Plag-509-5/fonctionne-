@@ -1,193 +1,165 @@
+'use strict';
+
 const fs = require('fs');
 const path = require('path');
 
-// Fichier de persistance locale pour les commandes réactions
 const LOCAL_STORE_FILE = path.join(process.cwd(), 'reaction_commands.json');
-
-// Map en mémoire: Map<emoji, { emoji: string, command: string, creator: string, sessionId: string, createdAt: number }>
+// Map<sessionId::emojiKey, { emoji, emojiKey, command, creator, sessionId, createdAt }>
 const reactionCmds = new Map();
-
 let mongoCol = null;
 
-/**
- * Normalise un emoji pour éviter les incohérences de sélecteurs de variation Unicode (ex: \uFE0F)
- * @param {string} emoji
- * @returns {string}
- */
+function normalizeSessionId(value) {
+  const digits = String(value || '').replace(/[^0-9]/g, '');
+  return digits || 'global';
+}
+
 function normalizeEmoji(emoji) {
   if (!emoji || typeof emoji !== 'string') return '';
   return emoji.trim().replace(/[\uFE0E\uFE0F]/g, '');
 }
 
-/**
- * Détecte si une chaîne est un emoji ou contient un emoji
- * @param {string} str
- * @returns {boolean}
- */
-function isEmoji(str) {
-  if (!str || typeof str !== 'string') return false;
-  const emojiRegex = /(\p{Emoji_Presentation}|\p{Extended_Pictographic})/u;
-  return emojiRegex.test(str);
+function scopedKey(sessionId, emoji) {
+  return `${normalizeSessionId(sessionId)}::${normalizeEmoji(emoji)}`;
 }
 
-/**
- * Initialise le stockage local et MongoDB
- */
+function cacheReaction(doc) {
+  if (!doc?.emoji || !doc?.command) return;
+  const sessionId = normalizeSessionId(doc.sessionId);
+  const emojiKey = normalizeEmoji(doc.emojiKey || doc.emoji);
+  reactionCmds.set(scopedKey(sessionId, emojiKey), { ...doc, sessionId, emojiKey });
+}
+
+function isEmoji(value) {
+  if (!value || typeof value !== 'string') return false;
+  return /(\p{Emoji_Presentation}|\p{Extended_Pictographic})/u.test(value);
+}
+
 async function initReactionDb(mongoDB) {
-  // 1. Charger depuis le fichier local JSON
   try {
     if (fs.existsSync(LOCAL_STORE_FILE)) {
-      const raw = fs.readFileSync(LOCAL_STORE_FILE, 'utf8');
-      const data = JSON.parse(raw);
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          if (item.emoji && item.command) {
-            const key = normalizeEmoji(item.emoji);
-            reactionCmds.set(key, item);
-          }
-        }
-      }
+      const data = JSON.parse(fs.readFileSync(LOCAL_STORE_FILE, 'utf8'));
+      if (Array.isArray(data)) data.forEach(cacheReaction);
     }
-  } catch (err) {
-    console.warn('[REACTION-CMD] Erreur lecture JSON local:', err.message);
+  } catch (error) {
+    console.warn('[REACTION-CMD] Erreur lecture JSON local:', error.message);
   }
 
-  // 2. Charger depuis MongoDB si disponible
   try {
     if (mongoDB) {
       mongoCol = mongoDB.collection('reaction_commands');
-      await mongoCol.createIndex({ emojiKey: 1 }, { unique: true });
-      const docs = await mongoCol.find({}).toArray();
-      for (const d of docs) {
-        if (d.emoji && d.command) {
-          const key = normalizeEmoji(d.emoji);
-          reactionCmds.set(key, d);
+      await mongoCol.updateMany(
+        { $or: [{ sessionId: { $exists: false } }, { sessionId: null }, { sessionId: '' }] },
+        { $set: { sessionId: 'global' } }
+      );
+      try { await mongoCol.dropIndex('emojiKey_1'); } catch (error) {
+        if (!['IndexNotFound', 27].includes(error?.codeName) && error?.code !== 27) {
+          console.warn('[REACTION-CMD] Suppression ancien index:', error.message);
         }
       }
+      await mongoCol.createIndex({ sessionId: 1, emojiKey: 1 }, { unique: true });
+      const docs = await mongoCol.find({}).toArray();
+      docs.forEach(cacheReaction);
     }
-  } catch (err) {
-    console.warn('[REACTION-CMD] Erreur initialisation MongoDB:', err.message);
+  } catch (error) {
+    console.warn('[REACTION-CMD] Erreur initialisation MongoDB:', error.message);
   }
 
   console.log(`✨ [REACTION-CMD] ${reactionCmds.size} commande(s) réaction chargée(s) en mémoire.`);
 }
 
-/**
- * Sauvegarde sur disque
- */
 async function persistReactionCmds() {
   try {
-    const list = Array.from(reactionCmds.values());
-    fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(list, null, 2));
-  } catch (err) {
-    console.error('[REACTION-CMD] Erreur écriture JSON:', err);
+    fs.writeFileSync(LOCAL_STORE_FILE, JSON.stringify(Array.from(reactionCmds.values()), null, 2));
+  } catch (error) {
+    console.error('[REACTION-CMD] Erreur écriture JSON:', error);
   }
 }
 
-/**
- * Enregistre une commande associée à une réaction emoji
- * @param {string} emoji - L'emoji (ex: '✅')
- * @param {string} command - La commande cible (ex: 'save', 'ping', 'tourl')
- * @param {string} [creator='']
- * @param {string} [sessionId='global']
- */
 async function setReactionCommand(emoji, command, creator = '', sessionId = 'global') {
   if (!emoji || !command) return false;
-
-  const rawEmoji = emoji.trim();
+  const normalizedSession = normalizeSessionId(sessionId);
+  const rawEmoji = String(emoji).trim();
   const emojiKey = normalizeEmoji(rawEmoji);
-  const cleanCmd = command.trim().replace(/^[./!#]/, ''); // Retire préfixe
+  const cleanCmd = String(command).trim().replace(/^[./!#]/, '');
+  if (!emojiKey || !cleanCmd) return false;
 
   const doc = {
     emoji: rawEmoji,
     emojiKey,
     command: cleanCmd,
     creator: String(creator || ''),
-    sessionId: String(sessionId || 'global'),
+    sessionId: normalizedSession,
     createdAt: Date.now()
   };
-
-  reactionCmds.set(emojiKey, doc);
+  reactionCmds.set(scopedKey(normalizedSession, emojiKey), doc);
   await persistReactionCmds();
 
   if (mongoCol) {
     try {
-      await mongoCol.updateOne({ emojiKey }, { $set: doc }, { upsert: true });
-    } catch (e) {
-      console.warn('[REACTION-CMD] Erreur upsert Mongo:', e.message);
+      await mongoCol.updateOne(
+        { sessionId: normalizedSession, emojiKey },
+        { $set: doc },
+        { upsert: true }
+      );
+    } catch (error) {
+      console.warn('[REACTION-CMD] Erreur upsert Mongo:', error.message);
     }
   }
-
   return true;
 }
 
-/**
- * Recherche une commande par emoji
- * @param {string} emoji
- * @returns {{ emoji: string, command: string, creator: string }|null}
- */
-function findReactionCommand(emoji) {
-  if (!emoji || typeof emoji !== 'string') return null;
-  const key = normalizeEmoji(emoji);
-  return reactionCmds.get(key) || null;
+function findReactionCommand(emoji, sessionId = 'global') {
+  const emojiKey = normalizeEmoji(emoji);
+  if (!emojiKey) return null;
+  return reactionCmds.get(scopedKey(sessionId, emojiKey)) || null;
 }
 
-/**
- * Supprime une commande de réaction (par emoji ou par nom de commande)
- * @param {string} emojiOrCommand
- * @returns {Promise<boolean>}
- */
-async function deleteReactionCommand(emojiOrCommand) {
+async function deleteReactionCommand(emojiOrCommand, sessionId = 'global') {
   if (!emojiOrCommand) return false;
+  const normalizedSession = normalizeSessionId(sessionId);
+  const directKey = scopedKey(normalizedSession, emojiOrCommand);
+  let targetKey = reactionCmds.has(directKey) ? directKey : null;
 
-  const key = normalizeEmoji(emojiOrCommand);
-  let targetKey = null;
-
-  if (reactionCmds.has(key)) {
-    targetKey = key;
-  } else {
-    // Chercher par nom de commande
-    const search = emojiOrCommand.toLowerCase().trim().replace(/^[./!#]/, '');
-    for (const [k, item] of reactionCmds.entries()) {
-      if (item.command.toLowerCase() === search) {
-        targetKey = k;
+  if (!targetKey) {
+    const search = String(emojiOrCommand).toLowerCase().trim().replace(/^[./!#]/, '');
+    for (const [key, item] of reactionCmds.entries()) {
+      if (item.sessionId === normalizedSession && String(item.command).toLowerCase() === search) {
+        targetKey = key;
         break;
       }
     }
   }
-
   if (!targetKey) return false;
 
+  const target = reactionCmds.get(targetKey);
   reactionCmds.delete(targetKey);
   await persistReactionCmds();
-
   if (mongoCol) {
     try {
-      await mongoCol.deleteOne({ emojiKey: targetKey });
-    } catch (e) {
-      console.warn('[REACTION-CMD] Erreur suppression Mongo:', e.message);
+      await mongoCol.deleteOne({ sessionId: normalizedSession, emojiKey: target.emojiKey });
+    } catch (error) {
+      console.warn('[REACTION-CMD] Erreur suppression Mongo:', error.message);
     }
   }
-
   return true;
 }
 
-/**
- * Liste toutes les commandes de réaction enregistrées
- */
-function getAllReactionCommands() {
-  return Array.from(reactionCmds.values());
+function getAllReactionCommands(sessionId = 'global') {
+  const normalizedSession = normalizeSessionId(sessionId);
+  return Array.from(reactionCmds.values()).filter(item => item.sessionId === normalizedSession);
 }
 
-// Initialisation au chargement
 initReactionDb().catch(() => {});
 
 module.exports = {
   initReactionDb,
+  normalizeSessionId,
   normalizeEmoji,
+  scopedKey,
   isEmoji,
   setReactionCommand,
   findReactionCommand,
   deleteReactionCommand,
-  getAllReactionCommands
+  getAllReactionCommands,
+  _test: { cacheReaction, reactionCmds }
 };

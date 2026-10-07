@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   normaliseNewsletterJid,
   normaliseEmojiList,
@@ -46,4 +48,22 @@ test('synchronise follow et unfollow sur toutes les sessions actives', async () 
   assert.equal(followed.filter(result => result.ok).length, 2);
   assert.equal(unfollowed.filter(result => result.ok).length, 2);
   assert.equal(events.length, 4);
+});
+
+test('la synchronisation cfn tolère un socket sans identifiant utilisateur', async () => {
+  const socket = {
+    async newsletterFollow(jid) {
+      assert.equal(jid, '120363402094635383@newsletter');
+    }
+  };
+  const result = await syncNewsletterSockets(new Map(), '120363402094635383', 'follow', [socket]);
+  assert.equal(result[0].session, 'session-inconnue');
+  assert.equal(result[0].ok, true);
+});
+
+test('cfn répond avec un payload texte sûr sans ancien bouton/image fragile', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'pair.js'), 'utf8');
+  const block = source.slice(source.indexOf("case 'cfn':"), source.indexOf("case 'chr':"));
+  assert.match(block, /socket\.sendMessage\(from/);
+  assert.doesNotMatch(block, /imagePayload|headerType|buttonId|META_AI_CFN/);
 });
