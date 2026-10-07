@@ -67,8 +67,10 @@ const { ytmp3, ytmp4 } = require('./youtube');
 const { getGroupAdminsInfo, jidToNumber } = require('./normalize');
 const { uploadFile: uploadCloudku } = require("cloudku-uploader");
 const FormData = require("form-data");
-// dans ton switch principal
-const { groupStatus, buildStatusContent } = require('./status');
+const {
+  resolveGroupSelection,
+  actorIdFromMessage
+} = require('./services/group-status-selector');
 const { handleAntiLink } = require('./antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('./antilink');
 const cheerio = require('cheerio');
@@ -1559,6 +1561,34 @@ function setupCommandHandlers(socket, number) {
     const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
     const cfg = await loadSessionConfigMerged(sessionId);  // fourni par ton système MongoDB
     console.log('[HANDLER] merged cfg for', sessionId, cfg);
+
+    // Une réponse numérique en conversation privée peut finaliser le choix du
+    // groupe pour `.swgc`. Elle est traitée avant le routeur de commandes afin
+    // que l’utilisateur n’ait pas à préfixer le numéro.
+    if (!remoteJid.endsWith('@g.us') && /^\d+$/.test(normalizedBody)) {
+      const selectionActor = actorIdFromMessage(socket, msg, remoteJid);
+      const selection = resolveGroupSelection(sessionId, selectionActor, normalizedBody);
+      if (selection.status !== 'none') {
+        activateCommandTheme('swgc', isOniThemeEnabled(cfg.THEME));
+        await wakeForCommand(socket, msg, cfg);
+        if (selection.status === 'selected') {
+          await socket.sendMessage(remoteJid, {
+            text: `✅ Groupe ciblé : *${selection.group.subject}*\n\n` +
+              `Tu peux maintenant utiliser ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc <texte> ` +
+              `ou répondre à un média avec ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+          }, { quoted: msg });
+        } else if (selection.status === 'invalid') {
+          await socket.sendMessage(remoteJid, {
+            text: `❌ Choix invalide. Réponds avec un numéro entre ${selection.min} et ${selection.max}.`
+          }, { quoted: msg });
+        } else if (selection.status === 'expired') {
+          await socket.sendMessage(remoteJid, {
+            text: `⌛ La sélection a expiré. Relance ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+          }, { quoted: msg });
+        }
+        return;
+      }
+    }
     
     // --- Traitement antilink (déjà existant) ---
     if (remoteJid && remoteJid.endsWith('@g.us')) {
@@ -4060,9 +4090,6 @@ ${prefix}goodbye reset — remettre le message par défaut`
   }
   break;
 }
-
-// Case swgc à coller dans ton switch principal
-// Utilise le module status.js et ton client nommé socket
 
 // ============================================================
 // TAKE — Renommer un sticker (titre + auteur KAIDO-MD)
@@ -8674,270 +8701,10 @@ ${footer}
 }
 
 
-// ================= CASE DANS TON BOT =================
-case 'swgc': {
-  try {
-    const crypto = require('crypto');
-    const { generateWAMessageContent, generateWAMessageFromContent, downloadContentFromMessage } = require('@rexxhayanasi/elaina-baileys');
+// `.swgc` est implémentée dans plugins/group/swgc.js. Le plugin est exécuté
+// avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
+// le groupe ciblé : seul groupStatusMessageV2 y est relayé.
 
-    async function groupStatus(client, jid, content) {
-      const inside = await generateWAMessageContent(content, {
-        upload: client.waUploadToServer
-      });
-      const messageSecret = crypto.randomBytes(32);
-      const m = generateWAMessageFromContent(
-        jid,
-        {
-          messageContextInfo: { messageSecret },
-          groupStatusMessageV2: {
-            message: { ...inside, messageContextInfo: { messageSecret } }
-          }
-        },
-        {}
-      );
-      await client.relayMessage(jid, m.message, { messageId: m.key.id });
-    }
-
-    function randomColor() {
-      return "#" + Math.floor(Math.random() * 16777215).toString(16).padStart(6, "0");
-    }
-
-    // Définir les variables nécessaires
-    const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    const textInput = args.join(' ').trim();
-    const jid = msg.key.remoteJid;
-    const sender = msg.key.participant || msg.key.remoteJid;
-    const isGroup = jid.endsWith('@g.us');
-    
-    // IMPORTANT: On ne répond que dans le groupe ou en privé selon le contexte
-    // Si c'est un groupe, on répond dans le groupe
-    // Si c'est un message privé, on répond en privé
-    const replyJid = isGroup ? jid : sender;
-
-    // Vérifier si on est dans un groupe
-    if (!isGroup) {
-      await socket.sendMessage(sender, { 
-        text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗚𝗥𝗢𝗨𝗣𝗘 』* ❏─╮\n` +
-              `│ ✦ *Erreur* ❌\n` +
-              `│ ✦ Cette commande ne peut être utilisée\n` +
-              `│ ✦ que dans un groupe !\n` +
-              `╰─────────────────╯\n` +
-              `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 ✨`
-      }, { quoted: msg });
-      break;
-    }
-
-    // Réaction d'attente dans le groupe
-    await socket.sendMessage(jid, { react: { text: "⏳", key: msg.key } });
-
-    // Si c'est une réponse à un message
-    if (msg.message?.extendedTextMessage?.contextInfo?.quotedMessage) {
-      const quotedMessage = msg.message.extendedTextMessage.contextInfo.quotedMessage;
-      
-      // Récupérer la caption originale du média cité
-      let originalCaption = "";
-      
-      if (quotedMessage.videoMessage && quotedMessage.videoMessage.caption) {
-        originalCaption = quotedMessage.videoMessage.caption;
-      } else if (quotedMessage.imageMessage && quotedMessage.imageMessage.caption) {
-        originalCaption = quotedMessage.imageMessage.caption;
-      }
-      
-      // Construire la nouvelle caption avec le watermark stylisé
-      let finalCaption = "";
-      const watermark = `\n\n━━━━━━━━━━━━━━\n✨ *𝗽𝗼𝘀𝘁𝗲𝗱 𝗯𝘆* ✨\n🐉 *𝐊𝐚𝐢𝐝𝐨-𝐌𝐃* 🐉`;
-      
-      if (originalCaption && textInput) {
-        finalCaption = `📝 *𝗖𝗮𝗽𝘁𝗶𝗼𝗻 𝗼𝗿𝗶𝗴𝗶𝗻𝗮𝗹𝗲* 📝\n❝ ${originalCaption} ❞\n\n💬 *𝗧𝗲𝘅𝘁𝗲 𝗮𝗷𝗼𝘂𝘁é* 💬\n❝ ${textInput} ❞${watermark}`;
-      } else if (originalCaption) {
-        finalCaption = `📝 *𝗖𝗮𝗽𝘁𝗶𝗼𝗻* 📝\n❝ ${originalCaption} ❞${watermark}`;
-      } else if (textInput) {
-        finalCaption = `💬 *𝗧𝗲𝘅𝘁𝗲* 💬\n❝ ${textInput} ❞${watermark}`;
-      } else {
-        finalCaption = `✨ *𝗦𝘁𝗮𝘁𝘂𝘁 𝗱𝗲 𝗴𝗿𝗼𝘂𝗽𝗲* ✨${watermark}`;
-      }
-      
-      // Traitement vidéo
-      if (quotedMessage.videoMessage) {
-        const videoMsg = quotedMessage.videoMessage;
-        
-        const stream = await downloadContentFromMessage(videoMsg, 'video');
-        const chunks = [];
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-        const buffer = Buffer.concat(chunks);
-        
-        const payload = {
-          video: buffer,
-          caption: finalCaption,
-          mimetype: videoMsg.mimetype || 'video/mp4',
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        // Confirmation dans le groupe UNIQUEMENT
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗩𝗜𝗗𝗘𝗢 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-      // Traitement image
-      else if (quotedMessage.imageMessage) {
-        const imgMsg = quotedMessage.imageMessage;
-        const stream = await downloadContentFromMessage(imgMsg, 'image');
-        const chunks = [];
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-        const buffer = Buffer.concat(chunks);
-        
-        const payload = {
-          image: buffer,
-          caption: finalCaption,
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗜𝗠𝗔𝗚𝗘 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-      // Traitement audio
-      else if (quotedMessage.audioMessage) {
-        const audioMsg = quotedMessage.audioMessage;
-        const stream = await downloadContentFromMessage(audioMsg, 'audio');
-        const chunks = [];
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-        const buffer = Buffer.concat(chunks);
-        
-        const payload = {
-          audio: buffer,
-          mimetype: audioMsg.mimetype || 'audio/mp4',
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        // Envoyer le texte séparément si présent
-        if (finalCaption) {
-          await socket.sendMessage(jid, {
-            text: finalCaption
-          });
-        }
-        
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗔𝗨𝗗𝗜𝗢 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-      // Message texte cité
-      else {
-        let quotedText = "";
-        if (quotedMessage.conversation) {
-          quotedText = quotedMessage.conversation;
-        } else if (quotedMessage.extendedTextMessage?.text) {
-          quotedText = quotedMessage.extendedTextMessage.text;
-        }
-        
-        const textToUse = textInput || quotedText;
-        
-        if (!textToUse) {
-          throw new Error("Aucun texte à publier");
-        }
-        
-        const finalText = `❝ ${textToUse} ❞${watermark}`;
-        
-        const payload = {
-          text: finalText,
-          backgroundColor: randomColor()
-        };
-        
-        await groupStatus(socket, jid, payload);
-        
-        await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-        await socket.sendMessage(jid, { 
-          text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗧𝗘𝗫𝗧𝗘 』* ❏─╮\n` +
-                `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-                `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-                `╰─────────────────╯\n` +
-                `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-          mentions: [sender]
-        });
-      }
-    } 
-    else if (textInput) {
-      // Message texte simple sans citation
-      const watermark = `\n\n━━━━━━━━━━━━━━\n✨ *𝗽𝗼𝘀𝘁𝗲𝗱 𝗯𝘆* ✨\n⚡ *𝐊𝐚𝐢𝐝𝐨-𝐌𝐃* 🐉`;
-      const finalText = `💬 *𝗠𝗲𝘀𝘀𝗮𝗴𝗲* 💬\n❝ ${textInput} ❞${watermark}`;
-      
-      const payload = {
-        text: finalText,
-        backgroundColor: randomColor()
-      };
-      
-      await groupStatus(socket, jid, payload);
-      
-      await socket.sendMessage(jid, { react: { text: "✅", key: msg.key } });
-      await socket.sendMessage(jid, { 
-        text: `╭─❏ *『 𝗦𝗧𝗔𝗧𝗨𝗧 𝗧𝗘𝗫𝗧𝗘 』* ❏─╮\n` +
-              `│ ✦ *𝗣𝘂𝗯𝗹𝗶é 𝗮𝘃𝗲𝗰 𝘀𝘂𝗰𝗰è𝘀* ✅\n` +
-              `│ ✦ 𝙿𝚊𝚛 : @${sender.split('@')[0]}\n` +
-              `╰─────────────────╯\n` +
-              `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`,
-        mentions: [sender]
-      });
-    }
-    else {
-      await socket.sendMessage(jid, { 
-        text: `╭─❏ *『 𝗘𝗥𝗥𝗘𝗨𝗥 』* ❏─╮\n` +
-              `│ ✦ *𝗨𝘀𝗮𝗴𝗲 𝗶𝗻𝗰𝗼𝗿𝗿𝗲𝗰𝘁* ❌\n` +
-              `│ ✦ 𝙴𝚡𝚎𝚖𝚙𝚕𝚎 : ${prefix}${command} 𝚂𝚊𝚕𝚞𝚝\n` +
-              `│ ✦ 𝙾𝚞 𝚛é𝚙𝚘𝚗𝚍 𝚊̀ 𝚞𝚗 𝚖é𝚍𝚒𝚊\n` +
-              `╰─────────────────╯\n` +
-              `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`
-      }, { quoted: msg });
-      await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
-    }
-
-  } catch (e) {
-    console.error('[SWGC ERROR]:', e);
-    const jid = msg?.key?.remoteJid;
-    const sender = msg?.key?.participant || msg?.key?.remoteJid;
-    const isGroup = jid?.endsWith('@g.us');
-    const replyJid = isGroup ? jid : sender;
-    
-    await socket.sendMessage(replyJid, { react: { text: "❌", key: msg.key } });
-    await socket.sendMessage(replyJid, { 
-      text: `╭─❏ *『 𝗘𝗥𝗥𝗘𝗨𝗥 』* ❏─╮\n` +
-            `│ ✦ *𝗨𝗻𝗲 𝗲𝗿𝗿𝗲𝘂𝗿 𝗲𝘀𝘁 𝘀𝘂𝗿𝘃𝗲𝗻𝘂𝗲* ❌\n` +
-            `│ ✦ 𝙳é𝚝𝚊𝚒𝚕 : ${e.message}\n` +
-            `╰─────────────────╯\n` +
-            `> © 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃 🐉`
-    });
-  }
-  break;
-}
 // ==================== DOWNLOAD MENU ====================
 
 

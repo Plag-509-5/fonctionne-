@@ -30,6 +30,7 @@
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
+  - **Statuts de groupe (`.swgc`) :** en privé, affiche les groupes communs, mémorise la cible choisie par numéro, puis publie textes/images/vidéos/audios via `groupStatusMessageV2` sans envoyer de confirmation dans la conversation du groupe.
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
@@ -134,6 +135,14 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 - Images, vidéos, audios, documents, stickers et médias à vue unique sont téléchargés puis renvoyés directement. Le store conserve les métadonnées 24 heures par défaut au lieu d’être vidé toutes les 20 minutes.
 
 `.tourl` essaie les hébergeurs l’un après l’autre. Une erreur Catbox telle que HTTP 412 déclenche automatiquement le fournisseur suivant plutôt que d’interrompre la commande.
+
+### Statut de groupe privé avec `.swgc`
+
+1. Envoie `.swgc` au bot en conversation privée.
+2. Réponds avec le numéro du groupe affiché.
+3. Envoie `.swgc ton texte` ou réponds à une image, vidéo ou note audio avec `.swgc`.
+
+Le bot vérifie que l’utilisateur appartient toujours au groupe avant chaque publication. Seul le statut `groupStatusMessageV2` est relayé au JID du groupe; les listes, erreurs et confirmations restent dans la conversation privée.
 
 ---
 

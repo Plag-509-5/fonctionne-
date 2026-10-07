@@ -3,10 +3,9 @@ const { generateWAMessageContent, generateWAMessageFromContent } = require("@whi
 const crypto = require("crypto");
 
 async function groupStatus(socket, jid, content) {
-  const { backgroundColor } = content;
-  delete content.backgroundColor;
+  const { backgroundColor, ...payload } = content || {};
 
-  const inside = await generateWAMessageContent(content, {
+  const inside = await generateWAMessageContent(payload, {
     upload: socket.waUploadToServer,
     backgroundColor
   });
